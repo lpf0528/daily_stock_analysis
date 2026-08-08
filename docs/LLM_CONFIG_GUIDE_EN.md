@@ -335,6 +335,40 @@ For the single-agent ask-stock path, the backend also keeps a provider-aware tra
 
 ---
 
+## Model & Search Engine Configuration Verification Methods
+
+After completing your LLM configuration (API Key / Base URL / Model) or news search provider setup (e.g. Tavily API Keys), verify connectivity using any of the following three methods:
+
+### 1. Command-Line Quick Connectivity Test (Recommended)
+
+Run one-line Python snippet commands in terminal to test LLM generation and Tavily search connectivity:
+
+- **Test LLM Model Generation:**
+  ```bash
+  python -c "from src.config import get_config; from litellm import completion; cfg = get_config(); res = completion(model=cfg.litellm_model, api_base=cfg.openai_base_url, api_key=cfg.openai_api_key, messages=[{'role':'user','content':'Hello'}]); print('Model Response:', res.choices[0].message.content)"
+  ```
+
+- **Test Tavily News Search:**
+  ```bash
+  python -c "from src.config import get_config; from src.search_service import TavilySearchProvider; cfg = get_config(); provider = TavilySearchProvider(cfg.tavily_api_keys); print('Search items count:', len(provider.search('A-shares').results))"
+  ```
+
+### 2. Main Program Dry-Run
+
+Test the full analysis pipeline without consuming heavy API quota (data fetching -> prompt assembly -> LLM output trigger):
+
+```bash
+python main.py --dry-run --stocks 600519
+```
+
+### 3. Web Settings UI Visual Check
+
+1. Start API backend: `uvicorn server:app --reload`
+2. Open Web UI settings page in browser (`http://localhost:5173/settings`).
+3. Locate "Generation Backend" and "LLM Configuration" cards, and click **"Test Generation Backend"** or **"Test JSON Connectivity"** to view live status and diagnostic info.
+
+---
+
 ## Method 3: Advanced YAML Config (Expert Setup)
 
 **Goal:** I want maximum control and origin-level routing rules for enterprise-grade high availability.

@@ -64,6 +64,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [API 规格](architecture/api_spec.json) | FastAPI OpenAPI 规格产物 |
+| [项目深度分析与上下文指南](PROJECT_ANALYSIS.md) | 项目全局架构、模块职责、数据流、Agent 引擎与开发规范 |
 | [贡献指南](CONTRIBUTING.md) | Issue、PR、测试、文档同步和协作要求 |
 
 ## 多语言

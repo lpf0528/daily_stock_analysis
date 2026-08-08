@@ -352,6 +352,40 @@ AGENT_CONTEXT_PROTECTED_TURNS=
 
 ---
 
+## 模型与搜索引擎配置验证方法
+
+当完成大模型配置（API Key / Base URL / Model）或新闻搜索引擎（如 Tavily API Keys）后，可通过以下三种方式验证配置是否正常生效：
+
+### 1. 命令行快速连通性测试（推荐）
+
+在终端中直接运行 Python 单行指令，验证已配置的 LLM 与 Tavily 服务：
+
+- **测试 LLM 模型生成连通性：**
+  ```bash
+  python -c "from src.config import get_config; from litellm import completion; cfg = get_config(); res = completion(model=cfg.litellm_model, api_base=cfg.openai_base_url, api_key=cfg.openai_api_key, messages=[{'role':'user','content':'Hello'}]); print('模型响应:', res.choices[0].message.content)"
+  ```
+
+- **测试 Tavily 新闻检索连通性：**
+  ```bash
+  python -c "from src.config import get_config; from src.search_service import TavilySearchProvider; cfg = get_config(); provider = TavilySearchProvider(cfg.tavily_api_keys); print('搜索结果数:', len(provider.search('A股').results))"
+  ```
+
+### 2. 主程序 Dry-Run 试运行
+
+在不消耗过多 API 配额的情况下，测试完整分析流程（抓取数据 -> 组装 Prompt -> 触发 LLM 输出）：
+
+```bash
+python main.py --dry-run --stocks 600519
+```
+
+### 3. Web 设置页可视化检测
+
+1. 启动服务 API 后端：`uvicorn server:app --reload`
+2. 在浏览器打开 Web UI 的设置页面（`http://localhost:5173/settings`）。
+3. 找到“生成后端”与“模型与 API 配置”区域，点击 **“测试生成后端”** 或 **“测试 JSON 连通性”** 即可直观查看连通状态与错误诊断信息。
+
+---
+
 ### LLM usage HMAC 遥测
 
 P0a usage telemetry 会为实际发送的 message 生成 HMAC-SHA256 指纹，用于后续判断相同 prompt/message 前缀是否稳定。该能力只写入本地 `llm_usage` 记录，不改变 prompt、provider 参数、cache hint、模型输出或 fallback 顺序。
