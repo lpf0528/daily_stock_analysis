@@ -2831,34 +2831,39 @@ class NotificationService(
     def save_report_to_file(
         self,
         content: str,
-        filename: Optional[str] = None
+        filename: Optional[str] = None,
+        stock_code: Optional[str] = None,
     ) -> str:
-        """
-        保存日报到本地文件
+        """保存报告到本地文件。若提供 stock_code，则按日期和股票代码组织文件。
 
         Args:
-            content: 日报内容
-            filename: 文件名（可选，默认按日期生成）
+            content: 报告内容字符串。
+            filename: 可选文件名，若不提供且未指定 stock_code，则使用日期生成的默认名称。
+            stock_code: 可选股票代码，用作文件名并放入对应日期目录。
 
         Returns:
-            保存的文件路径
+            保存的文件路径（字符串）。
         """
         from pathlib import Path
+        from datetime import datetime
 
-        if filename is None:
-            date_str = datetime.now().strftime('%Y%m%d')
-            filename = f"report_{date_str}.md"
-
-        # 确保 reports 目录存在（使用项目根目录下的 reports）
-        reports_dir = Path(__file__).parent.parent / 'reports'
-        reports_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime('%Y%m%d')
+        if stock_code:
+            # 保存到 data/reports/<date>/<stock_code>.md
+            reports_dir = Path(__file__).parent.parent / 'data' / 'reports' / date_str
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{stock_code}.md"
+        else:
+            if filename is None:
+                filename = f"report_{date_str}.md"
+            # 兼容原始行为，保存到项目根目录下的 reports
+            reports_dir = Path(__file__).parent.parent / 'reports'
+            reports_dir.mkdir(parents=True, exist_ok=True)
 
         filepath = reports_dir / filename
-
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-
-        logger.info(f"日报已保存到: {filepath}")
+        logger.info(f"报告已保存到: {filepath}")
         return str(filepath)
 
     def save_and_send_feishu_file(

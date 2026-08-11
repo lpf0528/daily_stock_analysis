@@ -316,11 +316,10 @@ def run_market_review(
             )
             if save_report_file:
                 # 保存报告到文件
-                date_str = datetime.now().strftime('%Y%m%d')
-                report_filename = f"market_review_{date_str}.md"
+                # 保存大盘复盘报告到固定代码目录，使用日期子目录
                 filepath = notifier.save_report_to_file(
                     markdown_report,
-                    report_filename
+                    stock_code="market_review",
                 )
                 logger.info(
                     "[MarketReview] component=market_review action=save_report "

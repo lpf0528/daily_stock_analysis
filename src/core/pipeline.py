@@ -3348,6 +3348,12 @@ class StockAnalysisPipeline:
                 if _supports_explicit_keyword(self.notifier.send, "structured_payload"):
                     send_kwargs["structured_payload"] = _share_image_payload(result)
                 sent = self.notifier.send(report_content, **send_kwargs)
+                # Save individual stock report to date-based directory
+                try:
+                    saved_path = self.notifier.save_report_to_file(report_content, stock_code=stock_code)
+                    logger.info(f"[{stock_code}] 报告已保存至: {saved_path}")
+                except Exception as e:
+                    logger.warning(f"[{stock_code}] 保存报告失败: {e}")
                 notification_run = self._build_notification_run_snapshot(
                     channel="report",
                     status="success" if sent else "failed",
