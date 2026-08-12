@@ -794,6 +794,51 @@ class AnalysisTaskQueue:
             
             return None
 
+    def cancel_task(self, task_id: str) -> Tuple[Optional[TaskInfo], bool]:
+        """
+        Cancel a task by ID.
+
+        Returns:
+            (task_info, success)
+            - success is True if task was cancelled or cancellation was requested.
+            - success is False if task was not found or already in terminal state.
+        """
+        with self._data_lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return None, False
+
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                return task.copy(), False
+
+            dedupe_key = _dedupe_stock_code_key(task.stock_code)
+            if self._analyzing_stocks.get(dedupe_key) == task_id:
+                del self._analyzing_stocks[dedupe_key]
+
+            future = self._futures.pop(task_id, None)
+            if future is not None:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                task.message = "Task cancelled before execution"
+                task_snapshot = task.copy()
+                self._broadcast_event("task_cancelled", task_snapshot.to_dict())
+                return task_snapshot, True
+
+            if task.status == TaskStatus.PROCESSING:
+                task.status = TaskStatus.CANCEL_REQUESTED
+                task.message = "Task cancellation requested"
+                task_snapshot = task.copy()
+                self._broadcast_event("task_progress", task_snapshot.to_dict())
+                return task_snapshot, True
+
+            return task.copy(), False
+
     def _execute_background_task(
         self,
         task_id: str,
@@ -812,6 +857,13 @@ class AnalysisTaskQueue:
         with self._data_lock:
             task = self._tasks.get(task_id)
             if not task:
+                return None
+
+            if task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED):
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                task.message = "Task cancelled before execution"
+                self._broadcast_event("task_cancelled", task.to_dict())
                 return None
 
             trace_id = task.trace_id or task_id
@@ -836,6 +888,16 @@ class AnalysisTaskQueue:
                 result = run_task()
             finally:
                 reset_run_diagnostic_context(diag_token)
+
+            with self._data_lock:
+                task = self._tasks.get(task_id)
+                if task and task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED):
+                    task.status = TaskStatus.CANCELLED
+                    task.completed_at = datetime.now()
+                    task.message = "Task cancelled during execution"
+                    self._broadcast_event("task_cancelled", task.to_dict())
+                    return None
+
             if result is None:
                 raise RuntimeError("任务返回空结果，未生成可持久化内容")
 
@@ -863,10 +925,20 @@ class AnalysisTaskQueue:
             with self._data_lock:
                 task = self._tasks.get(task_id)
                 if task:
-                    task.status = TaskStatus.FAILED
-                    task.completed_at = datetime.now()
-                    task.error = error_msg[:200]
-                    task.message = f"任务失败: {error_msg[:80]}"
+                    if getattr(e, "code", None) == "market_review_realtime_data_unavailable":
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now()
+                        task.error = getattr(e, "message", error_msg)[:200]
+                        task.message = "大盘实时市场统计不可用"
+                        task.result = {
+                            "error_code": "market_review_realtime_data_unavailable",
+                            "diagnostics": getattr(e, "diagnostics", {}),
+                        }
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now()
+                        task.error = error_msg[:200]
+                        task.message = f"任务失败: {error_msg[:80]}"
 
             if task:
                 self._broadcast_event("task_failed", task.to_dict())

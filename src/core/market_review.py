@@ -31,6 +31,7 @@ from src.services.run_diagnostics import (
     record_notification_run,
 )
 from src.schemas.market_light import MARKET_LIGHT_REGIONS
+from src.services.daily_market_context import MarketReviewDataUnavailableError
 from src.utils.market_review_region import (
     MARKET_REVIEW_REGION_ORDER,
     normalize_market_review_region_lenient,
@@ -297,6 +298,20 @@ def run_market_review(
                     report=review_report,
                 )
             }
+
+        realtime_mode = getattr(runtime_config, "market_review_realtime_mode", "bounded")
+        strict_for_orchestrator = getattr(runtime_config, "market_review_strict_for_orchestrator", True)
+        is_strict = (realtime_mode == "strict") or (strict_for_orchestrator and trigger_source in ("api", "orchestrator", "schedule"))
+
+        if is_strict:
+            for mkt_key, mkt_payload in market_review_payloads.items():
+                if mkt_key == "cn" and mkt_payload.get("market_context_status") == "unavailable":
+                    diag = mkt_payload.get("data_quality", {})
+                    logger.warning("[MarketReview] 严格模式下大盘实时统计不可用，触发终止: region=%s diag=%s", mkt_key, diag)
+                    raise MarketReviewDataUnavailableError(
+                        f"大盘复盘 [{mkt_key}] 实时市场统计数据不可用 (status=unavailable)，已终止任务。",
+                        diagnostics=diag,
+                    )
         
         if review_report:
             market_review_payload = _build_combined_market_review_payload(
@@ -439,10 +454,10 @@ def run_market_review(
                 return merge_markdown_report
             return review_report
         
-    except GenerationError:
+    except (GenerationError, MarketReviewDataUnavailableError):
         logger.exception(
             "[MarketReview] component=market_review action=failed "
-            "reason=generation_backend_config trigger_source=%s query_id=%s region=%s",
+            "trigger_source=%s query_id=%s region=%s",
             trigger_source,
             history_query_id,
             persist_region,

@@ -584,6 +584,43 @@ def trigger_market_review(
 
 
 # ============================================================
+# POST /tasks/{task_id}/cancel - 取消分析任务
+# ============================================================
+
+@router.post(
+    "/tasks/{task_id}/cancel",
+    status_code=202,
+    summary="取消分析任务",
+    description="取消正在进行或等待中的分析任务",
+)
+def cancel_analysis_task(task_id: str) -> Dict[str, Any]:
+    """
+    取消分析任务
+    
+    Returns:
+        202: 取消请求已接受
+        409: 任务处于终态不可取消
+        404: 任务不存在
+    """
+    task_queue = get_task_queue()
+    task_info, success = task_queue.cancel_task(task_id)
+    if not task_info:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+
+    if not success:
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务 {task_id} 已处于终态 ({task_info.status.value})，无法取消",
+        )
+
+    return {
+        "task_id": task_id,
+        "status": task_info.status.value,
+        "message": task_info.message or "任务已取消或已发出取消请求",
+    }
+
+
+# ============================================================
 # GET /tasks - 获取任务列表
 # ============================================================
 

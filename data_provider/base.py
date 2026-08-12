@@ -14,13 +14,16 @@
 3. 指数退避重试机制
 """
 
+import concurrent.futures
 import logging
 import random
+import socket
 import time
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any
+from typing import Callable, Optional, List, Tuple, Dict, Any, Set
 
 import pandas as pd
 import numpy as np
@@ -34,6 +37,138 @@ from .realtime_types import CircuitBreaker
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+
+PROVIDER_UPSTREAM_MAP: Dict[str, str] = {
+    "tickflow": "tickflow",
+    "tickflowfetcher": "tickflow",
+    "tushare": "tushare",
+    "tusharefetcher": "tushare",
+    "sina": "sina",
+    "sinafetcher": "sina",
+    "efinance": "eastmoney",
+    "efinancefetcher": "eastmoney",
+    "akshare": "eastmoney",
+    "akshare_em": "eastmoney",
+    "aksharefetcher": "eastmoney",
+}
+
+
+@dataclass
+class ProviderAttempt:
+    provider: str
+    upstream: str
+    started_at: str
+    duration_ms: int
+    status: str  # "success" | "empty" | "timeout" | "skipped" | "failed"
+    error_type: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "upstream": self.upstream,
+            "started_at": self.started_at,
+            "duration_ms": self.duration_ms,
+            "status": self.status,
+            "error_type": self.error_type,
+        }
+
+
+class MarketDataResult(dict):
+    """Data quality and payload container for market statistics."""
+
+    def __init__(
+        self,
+        status: str,  # "fresh" | "partial" | "unavailable" | "stale"
+        source: Optional[str] = None,
+        upstream: Optional[str] = None,
+        as_of: Optional[str] = None,
+        duration_ms: int = 0,
+        warnings: Optional[List[str]] = None,
+        attempts: Optional[List[ProviderAttempt]] = None,
+        data: Optional[Dict[str, Any]] = None,
+    ):
+        data_dict = dict(data) if isinstance(data, dict) else {}
+        super().__init__(data_dict)
+        self.status = status
+        self.source = source
+        self.upstream = upstream
+        self.as_of = as_of
+        self.duration_ms = duration_ms
+        self.warnings = list(warnings) if warnings else []
+        self.attempts = list(attempts) if attempts else []
+        self.data = data_dict
+
+    def __bool__(self) -> bool:
+        return self.status in ("fresh", "partial") and bool(self.data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "source": self.source,
+            "upstream": self.upstream,
+            "as_of": self.as_of,
+            "duration_ms": self.duration_ms,
+            "warnings": list(self.warnings),
+            "attempts": [a.to_dict() if hasattr(a, "to_dict") else a for a in self.attempts],
+            "data": self.data,
+        }
+
+
+class MarketReviewExecutionBudget:
+    """Execution deadline, timeout manager, and upstream circuit breaker for market review data calls."""
+
+    def __init__(
+        self,
+        total_timeout_seconds: float = 25.0,
+        provider_timeout_seconds: float = 5.0,
+        deadline: Optional[float] = None,
+    ):
+        self.total_timeout_seconds = max(1.0, float(total_timeout_seconds))
+        self.provider_timeout_seconds = max(0.5, float(provider_timeout_seconds))
+        self.start_time = time.monotonic()
+        self.deadline = deadline if deadline is not None else (self.start_time + self.total_timeout_seconds)
+        self.tripped_upstreams: Set[str] = set()
+
+    @property
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def is_expired(self) -> bool:
+        return time.monotonic() >= self.deadline
+
+    def get_provider_timeout(self) -> float:
+        return max(0.1, min(self.provider_timeout_seconds, self.remaining_seconds))
+
+    def trip_upstream(self, upstream: str, reason: str = ""):
+        if upstream and upstream not in self.tripped_upstreams:
+            self.tripped_upstreams.add(upstream)
+            logger.warning("[UpstreamCircuit] Tripped upstream circuit for '%s': %s", upstream, reason)
+
+    def is_upstream_tripped(self, upstream: str) -> bool:
+        return bool(upstream and upstream in self.tripped_upstreams)
+
+
+def is_circuit_tripping_exception(e: Exception) -> bool:
+    """Check if an exception represents a remote disconnection/unreachable error that should open circuit breaker."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return True
+    err_str = (str(e) + " " + type(e).__name__).lower()
+    keywords = [
+        "remotedisconnected",
+        "connection reset",
+        "curl (56)",
+        "connection refused",
+        "timed out",
+        "timeout",
+        "rate limit",
+        "too many requests",
+        "502",
+        "503",
+        "504",
+        "server disconnected",
+    ]
+    return any(kw in err_str for kw in keywords)
 
 
 # === 标准化列名定义 ===
@@ -404,7 +539,11 @@ class BaseFetcher(ABC):
         """
         return None
 
-    def get_sector_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+    def get_sector_rankings(
+        self,
+        n: int = 5,
+        budget: Optional[Any] = None,
+    ) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取板块涨跌榜
 
@@ -416,7 +555,11 @@ class BaseFetcher(ABC):
         """
         return None
 
-    def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
+    def get_concept_rankings(
+        self,
+        n: int = 5,
+        budget: Optional[Any] = None,
+    ) -> Optional[Tuple[List[Dict], List[Dict]]]:
         """
         获取概念/题材涨跌榜。
 
@@ -2486,75 +2629,179 @@ class DataFetcherManager:
                 continue
         return []
 
-    def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
-        """获取市场涨跌统计（自动切换数据源）"""
+    def _resolve_fetcher_by_name(self, name: str) -> Optional[BaseFetcher]:
+        name_clean = name.strip().lower()
+        if name_clean in ("tickflow", "tickflowfetcher"):
+            return self._get_tickflow_fetcher()
+        fetchers_lock = getattr(self, "_fetchers_lock", None)
+        fetchers = getattr(self, "_fetchers", [])
+        if fetchers_lock is not None:
+            with fetchers_lock:
+                for f in fetchers:
+                    fn = f.name.lower()
+                    if name_clean in fn or fn == name_clean:
+                        return f
+        else:
+            for f in fetchers:
+                fn = f.name.lower()
+                if name_clean in fn or fn == name_clean:
+                    return f
+        return None
+
+    def get_market_stats(
+        self,
+        *,
+        purpose: str = "unspecified",
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        providers: Optional[List[str]] = None,
+        config: Optional[Any] = None,
+    ) -> MarketDataResult:
+        """获取市场涨跌统计（带质量契约、按 provider 超时与 upstream 熔断）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
-        tickflow_fetcher = self._get_tickflow_fetcher()
-        if tickflow_fetcher is not None:
-            started_at = time.monotonic()
-            try:
-                data = tickflow_fetcher.get_market_stats()
-                elapsed = time.monotonic() - started_at
-                if data:
-                    logger.info(
-                        "[MarketStats] component=market_stats action=provider_success "
-                        "purpose=%s provider=TickFlowFetcher elapsed=%.2fs",
-                        purpose,
-                        elapsed,
+        t0 = time.monotonic()
+
+        exec_budget = budget
+        if exec_budget is None:
+            total_timeout = 25.0
+            provider_timeout = 5.0
+            if config:
+                total_timeout = float(getattr(config, "market_review_total_timeout_seconds", 25))
+                provider_timeout = float(getattr(config, "market_review_provider_timeout_seconds", 5))
+            exec_budget = MarketReviewExecutionBudget(
+                total_timeout_seconds=total_timeout,
+                provider_timeout_seconds=provider_timeout,
+            )
+
+        allowed_provider_names = providers
+        if not allowed_provider_names and config:
+            allowed_provider_names = getattr(config, "market_review_stats_providers", None)
+        if not allowed_provider_names:
+            fetcher_names = [
+                f.name.lower() for f in getattr(self, "_fetchers", []) if hasattr(f, "name")
+            ]
+            allowed_provider_names = ["tickflow"] + fetcher_names
+            if len(allowed_provider_names) <= 1:
+                allowed_provider_names = ["tickflow", "tushare", "sina", "efinance", "akshare"]
+
+        attempts: List[ProviderAttempt] = []
+        warnings: List[str] = []
+
+        for prov_name in allowed_provider_names:
+            prov_name_clean = prov_name.strip().lower()
+            upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+            start_iso = datetime.now().isoformat()
+
+            if exec_budget.is_expired():
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="budget_exhausted",
                     )
-                    return data
-                logger.info(
-                    "[MarketStats] component=market_stats action=provider_empty "
-                    "purpose=%s provider=TickFlowFetcher elapsed=%.2fs",
-                    purpose,
-                    elapsed,
                 )
-            except Exception as e:
-                elapsed = time.monotonic() - started_at
-                logger.warning(
-                    "[MarketStats] component=market_stats action=provider_failed "
-                    "purpose=%s provider=TickFlowFetcher elapsed=%.2fs error=%s",
-                    purpose,
-                    elapsed,
-                    e,
+                warnings.append(f"Provider '{prov_name_clean}' skipped: deadline expired")
+                continue
+
+            if exec_budget.is_upstream_tripped(upstream):
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="upstream_circuit_open",
+                    )
+                )
+                warnings.append(f"Provider '{prov_name_clean}' skipped: upstream '{upstream}' circuit open")
+                continue
+
+            fetcher = self._resolve_fetcher_by_name(prov_name_clean)
+            if fetcher is None:
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="not_configured",
+                    )
+                )
+                continue
+
+            per_timeout = exec_budget.get_provider_timeout()
+            res, err, duration_ms = self._run_with_timeout(
+                fetcher.get_market_stats,
+                per_timeout,
+                f"get_market_stats({prov_name_clean})",
+            )
+
+            if err:
+                is_timeout = "timeout" in err.lower()
+                status_str = "timeout" if is_timeout else "failed"
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status=status_str,
+                        error_type=err,
+                    )
+                )
+                warnings.append(f"Provider '{prov_name_clean}' {status_str}: {err}")
+                if is_timeout or any(kw in err.lower() for kw in ["remotedisconnected", "curl (56)", "connection reset"]):
+                    exec_budget.trip_upstream(upstream, reason=err)
+                continue
+
+            if res and isinstance(res, dict) and any(v for v in res.values()):
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status="success",
+                    )
+                )
+                elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+                as_of_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return MarketDataResult(
+                    status="fresh",
+                    source=fetcher.name,
+                    upstream=upstream,
+                    as_of=as_of_str,
+                    duration_ms=elapsed_total_ms,
+                    warnings=warnings,
+                    attempts=attempts,
+                    data=res,
                 )
 
-        for fetcher in self._fetchers:
-            if fetcher.name == "TickFlowFetcher":
-                continue
-            started_at = time.monotonic()
-            try:
-                data = fetcher.get_market_stats()
-                elapsed = time.monotonic() - started_at
-                if data:
-                    logger.info(
-                        "[MarketStats] component=market_stats action=provider_success "
-                        "purpose=%s provider=%s elapsed=%.2fs",
-                        purpose,
-                        fetcher.name,
-                        elapsed,
-                    )
-                    return data
-                logger.info(
-                    "[MarketStats] component=market_stats action=provider_empty "
-                    "purpose=%s provider=%s elapsed=%.2fs",
-                    purpose,
-                    fetcher.name,
-                    elapsed,
+            attempts.append(
+                ProviderAttempt(
+                    provider=prov_name_clean,
+                    upstream=upstream,
+                    started_at=start_iso,
+                    duration_ms=duration_ms,
+                    status="empty",
                 )
-            except Exception as e:
-                elapsed = time.monotonic() - started_at
-                logger.warning(
-                    "[MarketStats] component=market_stats action=provider_failed "
-                    "purpose=%s provider=%s elapsed=%.2fs error=%s",
-                    purpose,
-                    fetcher.name,
-                    elapsed,
-                    e,
-                )
-                continue
-        logger.warning("[MarketStats] component=market_stats action=complete status=empty purpose=%s", purpose)
-        return {}
+            )
+
+        elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+        return MarketDataResult(
+            status="unavailable",
+            source=None,
+            upstream=None,
+            as_of=None,
+            duration_ms=elapsed_total_ms,
+            warnings=warnings or ["Realtime market statistics unavailable from configured providers"],
+            attempts=attempts,
+            data=None,
+        )
 
     def _run_with_timeout(
         self,
@@ -2575,7 +2822,8 @@ class DataFetcherManager:
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
 
-        if not self._fundamental_timeout_slots.acquire(blocking=False):
+        slots = getattr(self, "_fundamental_timeout_slots", None)
+        if slots is not None and not slots.acquire(blocking=False):
             return None, f"{task_name} timeout worker pool exhausted", int(timeout_value * 1000)
 
         def runner() -> None:
@@ -2584,10 +2832,11 @@ class DataFetcherManager:
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
-                try:
-                    self._fundamental_timeout_slots.release()
-                except ValueError:
-                    pass
+                if slots is not None:
+                    try:
+                        slots.release()
+                    except ValueError:
+                        pass
 
         worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
         try:
@@ -3589,9 +3838,10 @@ class DataFetcherManager:
         )
 
     def _get_sector_rankings_with_meta(
-            self,
-            n: int = 5,
-        ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
+        self,
+        n: int = 5,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+    ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
             """Get sector rankings with ordered fallback chain metadata."""
             source_chain: List[Dict[str, Any]] = []
             last_error = ""
@@ -3641,10 +3891,13 @@ class DataFetcherManager:
 
             return [], [], source_chain, last_error
 
-    def get_sector_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+    def get_sector_rankings(
+        self,
+        n: int = 5,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+    ) -> Tuple[List[Dict], List[Dict]]:
         """获取板块涨跌榜（自动切换数据源）"""
-        # 按需求固定回退顺序：Akshare(EM) -> Akshare(Sina) -> Tushare -> Efinance
-        top, bottom, _, last_error = self._get_sector_rankings_with_meta(n)
+        top, bottom, _, last_error = self._get_sector_rankings_with_meta(n, budget=budget)
         if top or bottom:
             return top, bottom
         logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
@@ -3659,7 +3912,11 @@ class DataFetcherManager:
         with cls._concept_rankings_cache_lock:
             cls._concept_rankings_cache.clear()
 
-    def get_concept_rankings(self, n: int = 5) -> Tuple[List[Dict], List[Dict]]:
+    def get_concept_rankings(
+        self,
+        n: int = 5,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+    ) -> Tuple[List[Dict], List[Dict]]:
         """获取概念/题材涨跌榜（自动切换数据源）。"""
         try:
             normalized_n = int(n)

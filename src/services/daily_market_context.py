@@ -58,6 +58,16 @@ def run_market_review(**kwargs: Any) -> Any:
     return _run_market_review(**kwargs)
 
 
+class MarketReviewDataUnavailableError(RuntimeError):
+    """Raised when market review data (realtime stats/overview) is required but unavailable."""
+
+    def __init__(self, message: str, diagnostics: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.message = message
+        self.diagnostics = diagnostics or {}
+        self.code = "market_review_realtime_data_unavailable"
+
+
 @dataclass(frozen=True)
 class DailyMarketContext:
     """Low-sensitivity daily market background for stock analysis prompts."""
@@ -72,6 +82,7 @@ class DailyMarketContext:
     history_id: Optional[int] = None
     query_id: Optional[str] = None
     full_report: Optional[str] = None
+    status: str = "fresh"  # fresh | partial | unavailable | stale
 
     def to_safe_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -80,6 +91,7 @@ class DailyMarketContext:
             "summary": self.summary,
             "risk_tags": list(self.risk_tags),
             "source": self.source,
+            "status": self.status,
         }
         if self.position_cap:
             payload["position_cap"] = self.position_cap

@@ -1196,6 +1196,13 @@ class Config:
     # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、jp(日股)、kr(韩股)、both(全部市场)
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
+    # 大盘复盘实时统计与数据源限时/质量控制 (Issue #remediation)
+    market_review_realtime_mode: str = "bounded"  # strict | bounded | disabled
+    market_review_total_timeout_seconds: int = 25
+    market_review_provider_timeout_seconds: int = 5
+    market_review_stats_providers: List[str] = field(default_factory=lambda: ["tickflow", "tushare", "sina"])
+    market_review_strict_for_orchestrator: bool = True
+    market_review_allow_stale_cache_seconds: int = 0
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
@@ -2157,6 +2164,22 @@ class Config:
             market_review_color_scheme=cls._parse_market_review_color_scheme(
                 os.getenv('MARKET_REVIEW_COLOR_SCHEME', 'green_up')
             ),
+            market_review_realtime_mode=cls._parse_market_review_realtime_mode(
+                os.getenv('MARKET_REVIEW_REALTIME_MODE', 'bounded')
+            ),
+            market_review_total_timeout_seconds=parse_env_int(
+                os.getenv('MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS'), 25, field_name='MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS', minimum=1
+            ),
+            market_review_provider_timeout_seconds=parse_env_int(
+                os.getenv('MARKET_REVIEW_PROVIDER_TIMEOUT_SECONDS'), 5, field_name='MARKET_REVIEW_PROVIDER_TIMEOUT_SECONDS', minimum=1
+            ),
+            market_review_stats_providers=cls._parse_market_review_stats_providers(
+                os.getenv('MARKET_REVIEW_STATS_PROVIDERS')
+            ),
+            market_review_strict_for_orchestrator=os.getenv('MARKET_REVIEW_STRICT_FOR_ORCHESTRATOR', 'true').lower() == 'true',
+            market_review_allow_stale_cache_seconds=parse_env_int(
+                os.getenv('MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS'), 0, field_name='MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS', minimum=0
+            ),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
@@ -2900,6 +2923,35 @@ class Config:
         return 'green_up'
 
     @classmethod
+    def _parse_market_review_realtime_mode(cls, value: Optional[str]) -> str:
+        v = (value or 'bounded').strip().lower()
+        if v in ('strict', 'bounded', 'disabled'):
+            return v
+        logging.getLogger(__name__).warning(
+            "MARKET_REVIEW_REALTIME_MODE 配置值 '%s' 无效，已回退为默认值 'bounded'（合法值：strict / bounded / disabled）",
+            value,
+        )
+        return 'bounded'
+
+    @classmethod
+    def _parse_market_review_stats_providers(cls, value: Optional[str]) -> List[str]:
+        default_providers = ['tickflow', 'tushare', 'sina']
+        allowed = {'tickflow', 'tushare', 'sina', 'efinance', 'akshare', 'akshare_em'}
+        if not value or not value.strip():
+            return default_providers
+        parts = [p.strip().lower() for p in value.split(',') if p.strip()]
+        valid_parts = [p for p in parts if p in allowed]
+        if not valid_parts:
+            logging.getLogger(__name__).warning(
+                "MARKET_REVIEW_STATS_PROVIDERS 配置值 '%s' 无有效 provider，已回退为默认值 %s",
+                value,
+                ','.join(default_providers),
+            )
+            return default_providers
+        return valid_parts
+
+
+    @classmethod
     def _parse_md2img_engine(cls, value: str) -> str:
         """Parse MD2IMG_ENGINE, fallback to wkhtmltoimage for invalid values (Issue #455)."""
         v = (value or 'wkhtmltoimage').strip().lower()
@@ -3049,6 +3101,14 @@ class Config:
             primary environment variable / field name it relates to.
         """
         issues: List[ConfigIssue] = []
+
+        # --- Market Review Timeouts ---
+        if self.market_review_total_timeout_seconds < self.market_review_provider_timeout_seconds:
+            issues.append(ConfigIssue(
+                severity="warning",
+                message=f"MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS ({self.market_review_total_timeout_seconds}s) 应大于等于 MARKET_REVIEW_PROVIDER_TIMEOUT_SECONDS ({self.market_review_provider_timeout_seconds}s)",
+                field="MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS",
+            ))
 
         # --- Stock list ---
         if not self.stock_list:

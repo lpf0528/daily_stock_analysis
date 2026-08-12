@@ -33,7 +33,7 @@ from src.llm.generation_backend import GenerationError
 from src.schemas.market_light import MARKET_LIGHT_REGIONS, MarketLightSnapshot
 from src.services.run_diagnostics import record_llm_run, record_llm_run_started
 from src.services.intelligence_service import IntelligenceService
-from data_provider.base import DataFetcherManager
+from data_provider.base import DataFetcherManager, MarketReviewExecutionBudget, MarketDataResult
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,14 @@ class MarketOverview:
     bottom_sectors: List[Dict] = field(default_factory=list)  # 跌幅前5板块
     top_concepts: List[Dict] = field(default_factory=list)    # 涨幅前5概念
     bottom_concepts: List[Dict] = field(default_factory=list) # 跌幅前5概念
+
+    # 实时数据质量与上下文状态 (Issue #remediation)
+    market_context_status: str = "fresh"  # fresh | partial | unavailable | stale
+    as_of: Optional[str] = None
+    data_quality: Dict[str, Any] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    attempts: List[Dict[str, Any]] = field(default_factory=list)
+    market_stats_result: Optional[Any] = None
 
 
 @dataclass
@@ -421,34 +429,51 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             }
         return mapping[mood_key]
 
-    def get_market_overview(self) -> MarketOverview:
+    def get_market_overview(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+    ) -> MarketOverview:
         """
-        获取市场概览数据
+        获取市场概览数据（带时间预算与上游熔断控制）
         
         Returns:
             MarketOverview: 市场概览数据对象
         """
         today = datetime.now().strftime('%Y-%m-%d')
         overview = MarketOverview(date=today)
-        
+
+        exec_budget = budget
+        if exec_budget is None:
+            total_timeout = float(getattr(self.config, "market_review_total_timeout_seconds", 25))
+            provider_timeout = float(getattr(self.config, "market_review_provider_timeout_seconds", 5))
+            exec_budget = MarketReviewExecutionBudget(
+                total_timeout_seconds=total_timeout,
+                provider_timeout_seconds=provider_timeout,
+            )
+
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
         overview.indices = self._get_main_indices()
 
         # 2. 获取涨跌统计（A 股有，美股无等效数据）
         if self.profile.has_market_stats:
-            self._get_market_statistics(overview)
+            self._get_market_statistics(overview, budget=exec_budget)
+        else:
+            overview.market_context_status = "fresh"
 
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
-            self._get_sector_rankings(overview)
-            self._get_concept_rankings(overview)
-        
-        # 4. 获取北向资金（可选）
-        # self._get_north_flow(overview)
-        
+            self._get_sector_rankings(overview, budget=exec_budget)
+            self._get_concept_rankings(overview, budget=exec_budget)
+
+        overview.data_quality = {
+            "status": overview.market_context_status,
+            "as_of": overview.as_of,
+            "warnings": overview.warnings,
+            "attempts": overview.attempts,
+        }
+
         return overview
 
-    
     def _get_main_indices(self) -> List[MarketIndex]:
         """获取主要指数实时行情"""
         indices = []
@@ -491,24 +516,35 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 
         return indices
 
-    def _get_market_statistics(self, overview: MarketOverview):
+    def _get_market_statistics(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
         """获取市场涨跌统计"""
         try:
             logger.info("[大盘] %s action=get_market_stats status=start", self._log_context())
 
-            stats = self.data_manager.get_market_stats(purpose=f"market_review:{self.region}")
+            stats = self.data_manager.get_market_stats(
+                purpose=f"market_review:{self.region}",
+                budget=budget,
+                config=self.config,
+            )
+            overview.market_stats_result = stats
 
-            if stats:
+            if hasattr(stats, "to_dict"):
+                overview.warnings.extend(getattr(stats, "warnings", []))
+                overview.attempts.extend([a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(stats, "attempts", [])])
+
+            if stats and getattr(stats, "status", "fresh") in ("fresh", "partial"):
                 overview.up_count = stats.get('up_count', 0)
                 overview.down_count = stats.get('down_count', 0)
                 overview.flat_count = stats.get('flat_count', 0)
                 overview.limit_up_count = stats.get('limit_up_count', 0)
                 overview.limit_down_count = stats.get('limit_down_count', 0)
                 overview.total_amount = stats.get('total_amount', 0.0)
+                overview.market_context_status = getattr(stats, "status", "fresh")
+                overview.as_of = getattr(stats, "as_of", None)
 
                 logger.info(
                     "[大盘] %s action=get_market_stats status=success up=%s down=%s flat=%s "
-                    "limit_up=%s limit_down=%s amount=%.0f亿",
+                    "limit_up=%s limit_down=%s amount=%.0f亿 status=%s",
                     self._log_context(),
                     overview.up_count,
                     overview.down_count,
@@ -516,19 +552,26 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     overview.limit_up_count,
                     overview.limit_down_count,
                     overview.total_amount,
+                    overview.market_context_status,
                 )
             else:
-                logger.warning("[大盘] %s action=get_market_stats status=empty", self._log_context())
+                overview.market_context_status = "unavailable"
+                msg = "实时市场涨跌统计未取得（数据源不可用或在预算内超时）"
+                if msg not in overview.warnings:
+                    overview.warnings.append(msg)
+                logger.warning("[大盘] %s action=get_market_stats status=unavailable warnings=%s", self._log_context(), overview.warnings)
 
         except Exception as e:
+            overview.market_context_status = "unavailable"
+            overview.warnings.append(f"Market stats exception: {e}")
             logger.error("[大盘] %s action=get_market_stats status=failed error=%s", self._log_context(), e)
 
-    def _get_sector_rankings(self, overview: MarketOverview):
+    def _get_sector_rankings(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
         """获取板块涨跌榜"""
         try:
             logger.info("[大盘] %s action=get_sector_rankings status=start", self._log_context())
 
-            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
+            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5, budget=budget)
 
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
@@ -546,12 +589,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         except Exception as e:
             logger.error("[大盘] %s action=get_sector_rankings status=failed error=%s", self._log_context(), e)
 
-    def _get_concept_rankings(self, overview: MarketOverview):
+    def _get_concept_rankings(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
         """获取概念/题材涨跌榜（fail-open）。"""
         try:
             logger.info("[大盘] %s action=get_concept_rankings status=start", self._log_context())
 
-            top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5)
+            top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5, budget=budget)
 
             if top_concepts or bottom_concepts:
                 overview.top_concepts = top_concepts
@@ -828,6 +871,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 "total_amount": overview.total_amount,
                 "turnover_unit": self._get_turnover_unit_label(),
             }
+
+        payload["market_context_status"] = getattr(overview, "market_context_status", "fresh")
+        payload["as_of"] = getattr(overview, "as_of", None)
+        payload["data_quality"] = getattr(overview, "data_quality", {})
+        payload["warnings"] = list(getattr(overview, "warnings", []))
+        payload["attempts"] = list(getattr(overview, "attempts", []))
 
         return payload
 
@@ -1806,6 +1855,16 @@ Market conditions can change quickly. The data above is for reference only and d
 
         # 1. 获取市场概览
         overview = self.get_market_overview()
+
+        realtime_mode = getattr(self.config, "market_review_realtime_mode", "bounded")
+        strict_orchestrator = getattr(self.config, "market_review_strict_for_orchestrator", True)
+        if (realtime_mode == "strict" or strict_orchestrator) and overview.market_context_status == "unavailable" and self.region == "cn":
+            from src.services.daily_market_context import MarketReviewDataUnavailableError
+            logger.warning("[MarketReview] 严格模式下大盘实时统计不可用 (status=unavailable)，终止生成复盘报告")
+            raise MarketReviewDataUnavailableError(
+                f"大盘复盘 [{self.region}] 实时市场统计不可用 (status=unavailable)，已被严格模式阻断。",
+                diagnostics=overview.data_quality,
+            )
 
         # 2. 搜索市场新闻
         news = self.search_market_news()
