@@ -10,10 +10,15 @@ from datetime import date
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.analyzer import GeminiAnalyzer
 from src.core.pipeline import StockAnalysisPipeline
 from src.enums import ReportType
-from src.services.daily_market_context import DailyMarketContext
+from src.services.daily_market_context import (
+    DailyMarketContext,
+    MarketReviewDataUnavailableError,
+)
 
 
 def _pipeline_config(*, daily_market_context_enabled: bool) -> SimpleNamespace:
@@ -126,6 +131,7 @@ def test_pipeline_loads_daily_market_context_when_market_review_enabled() -> Non
         force_refresh=False,
         allow_generate=True,
         target_date=target_date,
+        market_context_policy="optional",
         current_query_id="pipeline-query",
     )
 
@@ -153,7 +159,9 @@ def test_pipeline_can_load_daily_market_context_without_runtime_generation() -> 
             target_date=date(2026, 6, 6),
         )
 
-    assert context is None
+    assert context is not None
+    assert context.status == "unavailable"
+    assert "【提示】" in context.summary
     service.get_context.assert_called_once()
     assert service.get_context.call_args.kwargs["allow_generate"] is False
 
@@ -193,6 +201,26 @@ def test_pipeline_skips_daily_market_context_when_config_is_disabled() -> None:
         )
 
     assert context is None
+    service_cls.assert_not_called()
+
+
+def test_pipeline_required_policy_fails_when_market_review_is_disabled() -> None:
+    """Required context must not silently continue when review generation is disabled."""
+    pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = SimpleNamespace(
+        market_review_enabled=False,
+        daily_market_context_enabled=True,
+        report_language="zh",
+    )
+    pipeline.daily_market_context_enabled = True
+    pipeline.market_context_policy = "required"
+
+    with patch("src.core.pipeline.DailyMarketContextService") as service_cls:
+        with pytest.raises(MarketReviewDataUnavailableError) as exc_info:
+            pipeline._load_daily_market_context("cn", target_date=date(2026, 6, 6))
+
+    assert exc_info.value.code == "market_review_realtime_data_unavailable"
+    assert exc_info.value.diagnostics["reason"] == "config.market_review_enabled flag"
     service_cls.assert_not_called()
 
 

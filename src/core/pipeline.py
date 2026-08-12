@@ -1854,10 +1854,19 @@ class StockAnalysisPipeline:
             )
 
         if getattr(self, "daily_market_context_enabled", True) is not True:
+            if policy == "required":
+                logger.warning("Daily market context disabled while policy is required")
+                raise MarketReviewDataUnavailableError("Daily market context disabled", diagnostics={"reason": "daily_market_context_enabled flag"})
             return None
         if getattr(self.config, "daily_market_context_enabled", True) is not True:
+            if policy == "required":
+                logger.warning("Config daily_market_context_enabled disabled while policy is required")
+                raise MarketReviewDataUnavailableError("Config daily_market_context_enabled disabled", diagnostics={"reason": "config.daily_market_context_enabled flag"})
             return None
         if getattr(self.config, "market_review_enabled", None) is not True:
+            if policy == "required":
+                logger.warning("Market review disabled while policy is required")
+                raise MarketReviewDataUnavailableError("Market review disabled", diagnostics={"reason": "config.market_review_enabled flag"})
             return None
 
         try:
