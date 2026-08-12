@@ -184,6 +184,25 @@ POST /api/v1/analysis/tasks/{task_id}/cancel
 5. 若数据源仍失败：在预算内失败的证明，以及用户需要配置或恢复的具体 provider；
 6. 明确声明没有发送通知、没有执行交易，也没有把缓存写为当日实时数据。
 
+## 7.1 实施进度（2026-08-12）
+
+### 已完成：代码修复与本地回归
+
+- 已实现 `MarketReviewExecutionBudget`、单 provider 超时、有界执行槽位，以及指数、涨跌统计、行业排行、概念排行共用的 deadline 与 upstream 熔断状态。
+- 已实现 `MarketDataResult` 与各组件质量信息；payload 可区分 `fresh`、`partial`、`unavailable`、`stale`，不再以默认零值表示数据不可用。
+- 概念排行缓存保存原始 `MarketDataResult`。缓存命中保留原始 `as_of`，并返回 `source=cache`、`status=stale`，不会伪造当前时间或当作实时数据。
+- 已实现市场复盘严格失败、单股 `required|optional|disabled` 请求级策略、队列失败错误码与取消检查点。`required` 在市场复盘上下文或市场复盘功能被禁用时抛出 `MarketReviewDataUnavailableError`；`optional` 返回明确标为 `unavailable` 的降级上下文。
+- 本地已验证：`tests/test_pipeline_daily_market_context.py`、`tests/test_market_review_remediation.py`、`tests/test_daily_market_context.py` 共 59 项通过；`git diff --check` 通过。该结果仅证明离线回归，不替代真实数据源验收。
+
+### 进行中：真实环境验收（阶段 D）
+
+`cross_project_pipeline` 仍必须把 DSA 视为未就绪，不得提交候选股、生成日终汇总或发送通知。解除条件是完成以下两类留痕验收：
+
+1. **不可用源失败探针**：以 `notify=false` 提交 `/api/v1/analysis/market-review`；确认任务在总预算（默认 25 秒）内终态为 `failed`，错误码为 `market_review_realtime_data_unavailable`，且无完成报告、无通知。
+2. **健康源成功探针**：先烟测并配置一个非 EastMoney 的真实可用 provider；再以 `notify=false` 运行市场复盘，确认任务 `completed`、payload 为 `fresh`、`as_of` 属于目标交易日、报告实际落盘。
+
+每次探针需保存任务 ID、开始/完成时间、报告路径（如有）、结构化 `data_quality` / `attempts` 摘要，以及脱敏日志。上述两项均通过后，才能提交 `605117` 单股无通知探针；该探针成功后才可解除跨项目候选股提交和后续推送阻断。
+
 ## 8. 非目标
 
 - 不修改 stock 的抓取逻辑，不通过 stock 数据库伪造 DSA 实时统计；
