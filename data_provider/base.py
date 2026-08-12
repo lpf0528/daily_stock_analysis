@@ -3980,7 +3980,14 @@ class DataFetcherManager:
                 continue
 
             prov_name_clean = fetcher.name.lower()
-            upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+            # AkShare's sector method probes the independent THS summary
+            # endpoint before any EastMoney fallback. Keep that probe eligible
+            # after EastMoney has been circuit-broken by another component.
+            upstream = (
+                "ths"
+                if prov_name_clean == "aksharefetcher"
+                else PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+            )
             start_iso = datetime.now().isoformat()
 
             if exec_budget.is_expired():
@@ -4167,7 +4174,22 @@ class DataFetcherManager:
                     continue
 
                 prov_name_clean = fetcher.name.lower()
-                upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+                # The default AkShare fetcher calls the independent InStock THS
+                # theme ranking adapter.  EastMoney only applies when explicitly
+                # configured, so an EastMoney circuit break must not skip THS.
+                try:
+                    from src.config import get_config
+
+                    concept_source = getattr(
+                        get_config(), "market_review_concept_rank_source", "ths"
+                    )
+                except Exception:
+                    concept_source = "ths"
+                upstream = (
+                    "ths"
+                    if prov_name_clean == "aksharefetcher" and concept_source == "ths"
+                    else PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+                )
                 start_iso = datetime.now().isoformat()
 
                 if exec_budget.is_expired():

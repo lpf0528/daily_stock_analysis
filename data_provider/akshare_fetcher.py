@@ -2012,8 +2012,13 @@ class AkshareFetcher(BaseFetcher):
         获取行业板块涨跌榜
 
         数据源优先级：
-        1. 东财接口 (ak.stock_board_industry_name_em)
-        2. 新浪接口 (ak.stock_sector_spot)
+        1. 同花顺接口 (ak.stock_board_industry_summary_ths)
+        2. 东财接口 (ak.stock_board_industry_name_em)
+        3. 新浪接口 (ak.stock_sector_spot)
+
+        同花顺汇总页返回的是可直接用于盘面复盘的行业涨跌幅、成交额
+        和上涨/下跌家数。它不依赖 EastMoney，因此在 EastMoney 熔断时
+        仍可作为真实但独立的行业排行来源。
         """
         import akshare as ak
 
@@ -2034,7 +2039,23 @@ class AkshareFetcher(BaseFetcher):
                 for _, row in bottom.iterrows()
             ]
             return top_sectors, bottom_sectors
-        
+
+        # 优先同花顺行业汇总，避免把 EastMoney 的多个包装库误当作独立容灾。
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+
+            logger.info("[API调用] ak.stock_board_industry_summary_ths() 获取板块排行(同花顺)...")
+            df = ak.stock_board_industry_summary_ths()
+            if df is not None and not df.empty:
+                change_col = '涨跌幅'
+                name = '板块'
+                if change_col in df.columns and name in df.columns:
+                    return _get_rank_top_n(df, change_col, name, n)
+                logger.warning("[Akshare] 同花顺行业汇总缺少预期字段，尝试其他来源")
+        except Exception as e:
+            logger.warning(f"[Akshare] 同花顺接口获取行业板块排行失败: {e}，尝试东财接口")
+
         # 优先东财接口
         try:
             self._set_random_user_agent()
@@ -2068,14 +2089,36 @@ class AkshareFetcher(BaseFetcher):
             return None
 
     def get_concept_rankings(self, n: int = 5) -> Optional[Tuple[List[Dict], List[Dict]]]:
-        """获取概念/题材涨跌榜。"""
+        """获取概念/题材涨跌榜。
+
+        默认复用 InStock 的同花顺题材实时排行；东财仅能经显式配置启用，
+        不能在同花顺失败后自动退回，避免把同一 EastMoney 上游误判为容灾。
+        """
+        source = getattr(get_config(), "market_review_concept_rank_source", "ths")
+        timeout = max(
+            1,
+            int(getattr(get_config(), "market_review_provider_timeout_seconds", 5)),
+        )
+
+        if source == "ths":
+            try:
+                from .instock_concept_rank_adapter import get_ths_concept_rankings
+
+                logger.info("[API调用] InStock 同花顺题材排行 获取概念排行...")
+                return get_ths_concept_rankings(n=n, timeout=timeout)
+            except Exception as e:
+                logger.warning("[Akshare] InStock 同花顺题材排行获取失败: %s", e)
+                return None
+
+        # market_review_concept_rank_source is parsed at startup, so reaching
+        # here means the user explicitly accepted the EastMoney dependency.
         import akshare as ak
 
         try:
             self._set_random_user_agent()
             self._enforce_rate_limit()
 
-            logger.info("[API调用] ak.stock_board_concept_name_em() 获取概念排行...")
+            logger.info("[API调用] ak.stock_board_concept_name_em() 获取概念排行(显式 EastMoney)...")
             df = ak.stock_board_concept_name_em()
             if df is None or df.empty:
                 return None
