@@ -1201,6 +1201,7 @@ class Config:
     market_review_total_timeout_seconds: int = 25
     market_review_provider_timeout_seconds: int = 5
     market_review_stats_providers: List[str] = field(default_factory=lambda: ["tickflow", "tushare", "sina"])
+    market_review_concept_rank_source: str = "ths"  # ths | eastmoney; 默认独立同花顺题材排行
     market_review_strict_for_orchestrator: bool = True
     market_review_allow_stale_cache_seconds: int = 3600
     market_context_policy: str = "optional"  # required | optional | disabled
@@ -2177,6 +2178,9 @@ class Config:
             market_review_stats_providers=cls._parse_market_review_stats_providers(
                 os.getenv('MARKET_REVIEW_STATS_PROVIDERS')
             ),
+            market_review_concept_rank_source=cls._parse_market_review_concept_rank_source(
+                os.getenv('MARKET_REVIEW_CONCEPT_RANK_SOURCE', 'ths')
+            ),
             market_review_strict_for_orchestrator=os.getenv('MARKET_REVIEW_STRICT_FOR_ORCHESTRATOR', 'true').lower() == 'true',
             market_review_allow_stale_cache_seconds=parse_env_int(
                 os.getenv('MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS'), 3600, field_name='MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS', minimum=0
@@ -2951,6 +2955,17 @@ class Config:
             )
             return default_providers
         return valid_parts
+
+    @classmethod
+    def _parse_market_review_concept_rank_source(cls, value: Optional[str]) -> str:
+        source = (value or "ths").strip().lower()
+        if source in ("ths", "eastmoney"):
+            return source
+        logging.getLogger(__name__).warning(
+            "MARKET_REVIEW_CONCEPT_RANK_SOURCE 配置值 '%s' 无效，已回退为默认值 'ths'（合法值：ths / eastmoney）",
+            value,
+        )
+        return "ths"
 
 
     @classmethod

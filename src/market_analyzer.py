@@ -1645,14 +1645,20 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         stats_block = ""
         sector_block = ""
         data_limits_block = ""
+        stats_available = (
+            self.profile.has_market_stats
+            and overview.market_stats_status in ("fresh", "partial")
+        )
+        sector_available = bool(overview.top_sectors or overview.bottom_sectors)
+        concept_available = bool(overview.top_concepts or overview.bottom_concepts)
         if review_language == "en":
-            if self.profile.has_market_stats:
+            if stats_available:
                 stats_block = f"""## Market Breadth
 - Advancers: {overview.up_count} | Decliners: {overview.down_count} | Flat: {overview.flat_count}
 - Limit-up: {overview.limit_up_count} | Limit-down: {overview.limit_down_count}
 - Turnover: {overview.total_amount:.0f} ({self._get_turnover_unit_label()})"""
 
-            if self.profile.has_sector_rankings:
+            if sector_available or concept_available:
                 sector_block = f"""## Sector / Theme Performance
 Industry leading: {top_sectors_text if top_sectors_text else "N/A"}
 Industry lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}
@@ -1660,22 +1666,24 @@ Concept leading: {top_concepts_text if top_concepts_text else "N/A"}
 Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 
             data_limit_lines = []
-            if not self.profile.has_market_stats:
+            if self.profile.has_market_stats and not stats_available:
                 data_limit_lines.append(
-                    "- Market breadth, aggregate turnover, participation, and fund-flow signals are not available for this market."
+                    "- Market breadth, aggregate turnover, participation, and fund-flow signals were not retrieved for this review; do not treat missing values as zero."
                 )
-            if not self.profile.has_sector_rankings:
-                data_limit_lines.append("- Sector/theme ranking data is not available for this market.")
+            if self.profile.has_sector_rankings and not sector_available:
+                data_limit_lines.append("- Industry-sector rankings were not retrieved for this review.")
+            if self.profile.has_sector_rankings and not concept_available:
+                data_limit_lines.append("- Concept/theme rankings were not retrieved for this review.")
             if data_limit_lines:
                 data_limits_block = "## Data Limits\n" + "\n".join(data_limit_lines)
         else:
-            if self.profile.has_market_stats:
+            if stats_available:
                 stats_block = f"""## 市场概况
 - 上涨: {overview.up_count} 家 | 下跌: {overview.down_count} 家 | 平盘: {overview.flat_count} 家
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元"""
 
-            if self.profile.has_sector_rankings:
+            if sector_available or concept_available:
                 sector_block = f"""## 板块表现
 行业领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
 行业领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
@@ -1683,10 +1691,12 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 概念领跌: {bottom_concepts_text if bottom_concepts_text else "暂无数据"}"""
 
             data_limit_lines = []
-            if not self.profile.has_market_stats:
-                data_limit_lines.append("- 该市场暂无涨跌家数、涨跌停、成交额汇总、参与度或资金流信号。")
-            if not self.profile.has_sector_rankings:
-                data_limit_lines.append("- 该市场暂无行业板块/概念题材涨跌榜。")
+            if self.profile.has_market_stats and not stats_available:
+                data_limit_lines.append("- 本次未取得涨跌家数、涨跌停、成交额汇总、参与度或资金流信号；缺失值不是零。")
+            if self.profile.has_sector_rankings and not sector_available:
+                data_limit_lines.append("- 本次未取得行业板块涨跌榜。")
+            if self.profile.has_sector_rankings and not concept_available:
+                data_limit_lines.append("- 本次未取得概念题材涨跌榜。")
             if data_limit_lines:
                 data_limits_block = "## 数据边界\n" + "\n".join(data_limit_lines)
 
@@ -1710,7 +1720,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             )
             market_summary_hint = (
                 "2-3 sentences summarizing overall market tone, index moves, and liquidity."
-                if self.profile.has_market_stats
+                if stats_available
                 else "2-3 sentences summarizing overall market tone, index moves, and available news context."
             )
         else:
@@ -1723,7 +1733,7 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
             )
             market_summary_hint = (
                 "2-3句话概括指数、涨跌家数、成交额和情绪温度，明确“强势/偏暖/震荡/偏弱”判断"
-                if self.profile.has_market_stats
+                if stats_available
                 else "2-3句话概括指数表现、新闻线索和整体风险状态，不要补写未提供的市场宽度或资金流数据"
             )
 

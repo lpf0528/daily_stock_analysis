@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] 大盘复盘概念/题材排行默认复用 InStock 已验证的同花顺实时排行，标记独立 `ths` 上游；仅在 `MARKET_REVIEW_CONCEPT_RANK_SOURCE=eastmoney` 显式配置时调用 AkShare 东财概念排行，避免 EastMoney 熔断误伤非东财数据源。
 - [文档] 更新大盘复盘实时统计整改任务书的实施状态：记录预算、熔断、缓存真实性与请求级策略的本地回归已完成；明确真实 API 探针、非 EastMoney 健康源验证、报告落盘和跨项目解除阻断仍为上线前必做验收。
 - [修复] `market_context_policy=required` 在每日大盘上下文、配置上下文或市场复盘被禁用时明确抛出 `MarketReviewDataUnavailableError`，不再静默继续个股分析；`optional` 保持返回明确标记为不可用的降级上下文。
 - [修复] 消除大盘复盘实时统计失败引发的系统卡死与无限等待：增加执行时间预算与超时管理（`MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS` / `MARKET_REVIEW_PROVIDER_TIMEOUT_SECONDS`），实现 EastMoney 等上游网络断连的快速熔断避让与 `MarketDataResult` 数据质量元数据追踪，增加严格/降级模式区分（`MARKET_REVIEW_REALTIME_MODE`）与 `MarketReviewDataUnavailableError` 显式失败机制，提供 `POST /api/v1/analysis/tasks/{task_id}/cancel` 任务取消 API。
