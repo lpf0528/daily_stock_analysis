@@ -298,17 +298,31 @@ class DailyMarketContextService:
                         self._cache[cache_key] = history_context
                         return history_context
 
-            generated = self._run_market_review_context(
-                region=normalized_region,
-                target_date=context_date,
-                config=config,
-                notifier=notifier,
-                analyzer=analyzer,
-                search_service=search_service,
-                persist_market_review_history=persist_market_review_history,
-                current_query_id=current_query_id,
-                require_query_id_match=require_query_id_match,
-            )
+            try:
+                generated = self._run_market_review_context(
+                    region=normalized_region,
+                    target_date=context_date,
+                    config=config,
+                    notifier=notifier,
+                    analyzer=analyzer,
+                    search_service=search_service,
+                    persist_market_review_history=persist_market_review_history,
+                    current_query_id=current_query_id,
+                    require_query_id_match=require_query_id_match,
+                )
+            except Exception as exc:
+                if policy == "required":
+                    raise
+                logger.warning("大盘环境获取失败（非严格模式降级处理）: %s", exc)
+                return DailyMarketContext(
+                    region=normalized_region,
+                    trade_date=context_date,
+                    summary="【提示】大盘环境未取得实时统计（数据源不可用或超时）。本分析基于个股基本面与技术面完成。",
+                    source="fallback",
+                    status="unavailable",
+                    created_at=datetime.now(),
+                )
+
             if generated is not None:
                 if policy == "required" and generated.status != "fresh":
                     raise MarketReviewDataUnavailableError(
@@ -316,9 +330,19 @@ class DailyMarketContextService:
                         diagnostics={"status": generated.status},
                     )
                 self._cache[cache_key] = generated
-            elif policy == "required":
+                return generated
+
+            if policy == "required":
                 raise MarketReviewDataUnavailableError("Required market context generation failed to produce context")
-            return generated
+
+            return DailyMarketContext(
+                region=normalized_region,
+                trade_date=context_date,
+                summary="【提示】大盘环境未取得实时统计（数据源不可用或超时）。本分析基于个股基本面与技术面完成。",
+                source="fallback",
+                status="unavailable",
+                created_at=datetime.now(),
+            )
 
     def _load_same_day_history(
         self,

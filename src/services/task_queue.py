@@ -85,6 +85,7 @@ class TaskInfo:
     portfolio_context: Optional[Dict[str, Any]] = None
     skills: Optional[List[str]] = None
     report_language: Optional[str] = None
+    market_context_policy: Optional[str] = None
     trace_id: Optional[str] = None
     region: Optional[str] = None
     flow_events: List[Dict[str, Any]] = field(default_factory=list)
@@ -391,6 +392,7 @@ class AnalysisTaskQueue:
         notify: bool = True,
         skills: Optional[List[str]] = None,
         report_language: Optional[str] = None,
+        market_context_policy: Optional[str] = None,
     ) -> Tuple[List[TaskInfo], List[DuplicateTaskError]]:
         """
         Submit analysis tasks in batch.
@@ -434,6 +436,7 @@ class AnalysisTaskQueue:
                     portfolio_context=dict(portfolio_context) if isinstance(portfolio_context, dict) else None,
                     skills=task_skills,
                     report_language=report_language,
+                    market_context_policy=market_context_policy,
                 )
                 self._tasks[task_id] = task_info
                 self._analyzing_stocks[dedupe_key] = task_id
@@ -696,6 +699,7 @@ class AnalysisTaskQueue:
             analysis_phase = task.analysis_phase
             query_source = task.query_source or "api"
             portfolio_context = dict(task.portfolio_context) if isinstance(task.portfolio_context, dict) else None
+            market_context_policy = task.market_context_policy
             task.status = TaskStatus.PROCESSING
             task.started_at = datetime.now()
             task.message = "正在分析中..."
@@ -736,6 +740,7 @@ class AnalysisTaskQueue:
                 query_source=query_source,
                 portfolio_context=portfolio_context,
                 report_language=report_language,
+                market_context_policy=market_context_policy,
             )
             reset_run_diagnostic_context(diag_token)
             diag_token = None
@@ -777,10 +782,20 @@ class AnalysisTaskQueue:
             with self._data_lock:
                 task = self._tasks.get(task_id)
                 if task:
-                    task.status = TaskStatus.FAILED
-                    task.completed_at = datetime.now()
-                    task.error = error_msg[:200]  # 限制错误信息长度
-                    task.message = f"分析失败: {error_msg[:50]}"
+                    if getattr(e, "code", None) == "market_review_realtime_data_unavailable":
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now()
+                        task.error = getattr(e, "message", error_msg)[:200]
+                        task.message = "大盘实时市场统计不可用"
+                        task.result = {
+                            "error_code": "market_review_realtime_data_unavailable",
+                            "diagnostics": getattr(e, "diagnostics", {}),
+                        }
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.completed_at = datetime.now()
+                        task.error = error_msg[:200]  # 限制错误信息长度
+                        task.message = f"分析失败: {error_msg[:50]}"
                     
                     # 从分析中集合移除
                     dedupe_key = _dedupe_stock_code_key(task.stock_code)

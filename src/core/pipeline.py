@@ -63,6 +63,7 @@ from src.phase_decision_guardrail import apply_phase_decision_guardrails
 from src.services.daily_market_context import (
     DailyMarketContext,
     DailyMarketContextService,
+    MarketReviewDataUnavailableError,
     format_daily_market_context_prompt_section,
 )
 from src.services.social_sentiment_service import SocialSentimentService
@@ -224,6 +225,7 @@ class StockAnalysisPipeline:
         portfolio_context: Optional[Dict[str, Any]] = None,
         daily_market_context_enabled: Optional[bool] = None,
         daily_market_context_allow_generate: bool = True,
+        market_context_policy: Optional[str] = None,
     ):
         """
         初始化调度器
@@ -251,6 +253,7 @@ class StockAnalysisPipeline:
             else bool(daily_market_context_enabled)
         )
         self.daily_market_context_allow_generate = daily_market_context_allow_generate
+        self.market_context_policy = market_context_policy or getattr(self.config, "market_context_policy", "optional")
         
         # 初始化各模块
         self.db = get_db()
@@ -1880,10 +1883,51 @@ class StockAnalysisPipeline:
             current_query_id = getattr(self, "query_id", None)
             if isinstance(current_query_id, str) and current_query_id.strip():
                 get_context_kwargs["current_query_id"] = current_query_id
-            return service.get_context(**get_context_kwargs)
+            ctx_res = service.get_context(**get_context_kwargs)
+            if ctx_res is None:
+                if policy == "required":
+                    raise MarketReviewDataUnavailableError(
+                        "Required market context unavailable",
+                        diagnostics={"reason": "service returned None"},
+                    )
+                # optional: return fallback unavailable context
+                logger.warning("Market context unavailable, falling back to unavailable context")
+                return DailyMarketContext(
+                    region=market,
+                    trade_date=target_date or date.today(),
+                    summary="【提示】大盘环境未取得实时统计（数据源不可用或超时）。本分析基于个股基本面与技术面完成。",
+                    source="fallback",
+                    status="unavailable",
+                    created_at=datetime.now(),
+                )
+            return ctx_res
+        except MarketReviewDataUnavailableError:
+            if policy == "required":
+                raise
+            logger.warning("加载大盘环境上下文引发 MarketReviewDataUnavailableError，非 required 模式降级处理")
+            return DailyMarketContext(
+                region=market,
+                trade_date=target_date or date.today(),
+                summary="【提示】大盘环境未取得实时统计（数据源不可用或超时）。本分析基于个股基本面与技术面完成。",
+                source="fallback",
+                status="unavailable",
+                created_at=datetime.now(),
+            )
         except Exception as exc:
-            logger.warning("加载大盘环境上下文失败，个股分析继续: %s", exc, exc_info=True)
-            return None
+            if policy == "required":
+                raise MarketReviewDataUnavailableError(
+                    f"Required market context load failed: {exc}",
+                    diagnostics={"error": str(exc)},
+                ) from exc
+            logger.warning("加载大盘环境上下文失败，个股分析降级继续: %s", exc, exc_info=True)
+            return DailyMarketContext(
+                region=market,
+                trade_date=target_date or date.today(),
+                summary="【提示】大盘环境未取得实时统计（数据源不可用或超时）。本分析基于个股基本面与技术面完成。",
+                source="fallback",
+                status="unavailable",
+                created_at=datetime.now(),
+            )
 
     def _get_daily_market_context_service_lock(self) -> threading.Lock:
         service_lock = getattr(self, "_daily_market_context_service_lock", None)
@@ -3116,6 +3160,8 @@ class StockAnalysisPipeline:
             
             return result
             
+        except MarketReviewDataUnavailableError:
+            raise
         except Exception as e:
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")

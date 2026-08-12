@@ -225,6 +225,10 @@ def run_market_review(
         persist_region,
     )
 
+    realtime_mode = getattr(runtime_config, "market_review_realtime_mode", "bounded")
+    strict_for_orchestrator = getattr(runtime_config, "market_review_strict_for_orchestrator", True)
+    is_strict = (realtime_mode == "strict") or (strict_for_orchestrator and trigger_source in ("api", "orchestrator", "schedule"))
+
     try:
         if len(run_markets) > 1:
             # 多市场顺序执行，合并报告
@@ -248,7 +252,10 @@ def run_market_review(
                     region=mkt,
                     config=runtime_config,
                 )
-                review_result = mkt_analyzer.run_daily_review_with_snapshot(cancellation_fn=cancellation_fn)
+                review_result = mkt_analyzer.run_daily_review_with_snapshot(
+                    cancellation_fn=cancellation_fn,
+                    strict_realtime_required=is_strict,
+                )
                 mkt_report = review_result.report
                 _collect_market_light_snapshot(
                     market_light_snapshots,
@@ -286,7 +293,10 @@ def run_market_review(
                 region=run_region,
                 config=runtime_config,
             )
-            review_result = market_analyzer.run_daily_review_with_snapshot(cancellation_fn=cancellation_fn)
+            review_result = market_analyzer.run_daily_review_with_snapshot(
+                cancellation_fn=cancellation_fn,
+                strict_realtime_required=is_strict,
+            )
             review_report = review_result.report
             market_light_snapshots = {}
             _collect_market_light_snapshot(

@@ -389,6 +389,9 @@ def _handle_async_analysis_batch(
         submit_kwargs["report_language"] = report_language
     if skills is not None:
         submit_kwargs["skills"] = skills
+    market_context_policy = getattr(request, "market_context_policy", None)
+    if market_context_policy is not None:
+        submit_kwargs["market_context_policy"] = market_context_policy
 
     accepted_tasks, duplicate_errors = task_queue.submit_tasks_batch(**submit_kwargs)
 
@@ -477,6 +480,7 @@ def _handle_sync_analysis(
             skills=getattr(request, "skills", None),
             analysis_phase=request.analysis_phase,
             report_language=getattr(request, "report_language", None),
+            market_context_policy=getattr(request, "market_context_policy", None),
         )
 
         if result is None:

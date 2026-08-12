@@ -4138,17 +4138,20 @@ class DataFetcherManager:
             cached = self.__class__._concept_rankings_cache.get(normalized_n)
             if cached and cached[0] > now:
                 logger.debug("[概念排行] 命中共享缓存 n=%s", normalized_n)
-                top = self._copy_ranking_rows(cached[1])
-                bottom = self._copy_ranking_rows(cached[2])
+                cached_res = cached[1]
+                data_dict = getattr(cached_res, "data", None) or cached_res
+                top = self._copy_ranking_rows(data_dict.get("top") or [])
+                bottom = self._copy_ranking_rows(data_dict.get("bottom") or [])
+                status_val = "stale" if (top or bottom) else getattr(cached_res, "status", "stale")
                 return MarketDataResult(
-                    status="fresh",
+                    status=status_val,
                     source="cache",
-                    upstream="cache",
-                    as_of=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    upstream=cached_res.upstream,
+                    as_of=cached_res.as_of,
                     duration_ms=0,
-                    warnings=[],
-                    attempts=[],
-                    data={"top": top, "bottom": bottom},
+                    warnings=list(cached_res.warnings) if cached_res.warnings else [],
+                    attempts=list(cached_res.attempts) if cached_res.attempts else [],
+                    data={"top": top, "bottom": bottom} if (top or bottom) else None,
                 )
 
             top: List[Dict] = []
@@ -4255,18 +4258,10 @@ class DataFetcherManager:
                 if top or bottom
                 else self.__class__._CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS
             )
-            cached_top = self._copy_ranking_rows(top)
-            cached_bottom = self._copy_ranking_rows(bottom)
-            self.__class__._concept_rankings_cache[normalized_n] = (
-                time.monotonic() + ttl,
-                cached_top,
-                cached_bottom,
-            )
-
             elapsed_total_ms = int((time.monotonic() - t0) * 1000)
             status_val = "fresh" if (top or bottom) else "unavailable"
             as_of_val = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if (top or bottom) else None
-            return MarketDataResult(
+            res = MarketDataResult(
                 status=status_val,
                 source="fetcher" if (top or bottom) else None,
                 upstream=attempts[-1].upstream if attempts else None,
@@ -4276,23 +4271,11 @@ class DataFetcherManager:
                 attempts=attempts,
                 data={"top": top, "bottom": bottom} if (top or bottom) else None,
             )
-
-            if not top and not bottom and last_error:
-                logger.warning(f"[概念排行] 所有数据源均失败，最终错误: {last_error}")
-
-            ttl = (
-                self.__class__._CONCEPT_RANKINGS_CACHE_TTL_SECONDS
-                if top or bottom
-                else self.__class__._CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS
-            )
-            cached_top = self._copy_ranking_rows(top)
-            cached_bottom = self._copy_ranking_rows(bottom)
             self.__class__._concept_rankings_cache[normalized_n] = (
                 time.monotonic() + ttl,
-                cached_top,
-                cached_bottom,
+                res,
             )
-            return self._copy_ranking_rows(cached_top), self._copy_ranking_rows(cached_bottom)
+            return res
 
     def get_hot_stocks(self, n: int = 10) -> List[Dict[str, Any]]:
         """获取市场人气股榜（自动切换数据源）。"""

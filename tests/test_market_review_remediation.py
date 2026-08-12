@@ -342,7 +342,74 @@ class TestMarketReviewBehavioralCoverage(unittest.TestCase):
         notifier.send_report.assert_not_called()
         notifier.save_report_to_file.assert_not_called()
 
+    def test_concept_cache_authenticity_preserves_as_of_and_returns_stale(self):
+        """Test concept cache stores original as_of and returns status=stale on hit without forging datetime.now()."""
+        DataFetcherManager.clear_concept_rankings_cache_for_tests()
+        manager = DataFetcherManager()
+
+        mock_fetcher = MagicMock()
+        mock_fetcher.name = "efinance"
+        mock_fetcher.get_concept_rankings.return_value = (
+            [{"name": "AI芯片", "change_pct": 3.5}],
+            [{"name": "传统能耗", "change_pct": -2.1}],
+        )
+
+        with patch.object(manager, "_get_fetchers_snapshot", return_value=[mock_fetcher]):
+            res1 = manager.get_concept_rankings(5)
+            self.assertEqual(res1.status, "fresh")
+            original_as_of = res1.as_of
+
+            time.sleep(0.01)
+
+            # Hit cache
+            res2 = manager.get_concept_rankings(5)
+            self.assertEqual(res2.status, "stale")
+            self.assertEqual(res2.source, "cache")
+            self.assertEqual(res2.as_of, original_as_of)
+
+    def test_single_stock_optional_degradation_returns_unavailable_context(self):
+        """Test single-stock optional mode returns standardized unavailable context rather than raising or returning None."""
+        from src.services.daily_market_context import DailyMarketContextService
+
+        service = DailyMarketContextService(db_manager=MagicMock())
+        config = Config(market_review_realtime_mode="strict")
+        notifier = MagicMock()
+
+        with patch.object(service, "_run_market_review_context", side_effect=RuntimeError("Data provider network error")):
+            ctx = service.get_context(
+                region="cn",
+                config=config,
+                notifier=notifier,
+                allow_generate=True,
+                market_context_policy="optional",
+            )
+            self.assertIsNotNone(ctx)
+            self.assertEqual(ctx.status, "unavailable")
+            self.assertIn("【提示】", ctx.summary)
+
+    def test_analyze_api_contract_policy_plumbing(self):
+        """Test AnalyzeRequest market_context_policy is passed down through task submission."""
+        from api.v1.schemas.analysis import AnalyzeRequest
+        from api.v1.endpoints.analysis import _handle_async_analysis_batch
+
+        req = AnalyzeRequest(
+            stock_code="600519",
+            market_context_policy="disabled",
+        )
+
+        with patch("api.v1.endpoints.analysis.get_task_queue") as mock_tq:
+            mock_queue_inst = MagicMock()
+            mock_queue_inst.submit_tasks_batch.return_value = ([], [])
+            mock_tq.return_value = mock_queue_inst
+
+            _handle_async_analysis_batch(["600519"], req)
+
+            mock_queue_inst.submit_tasks_batch.assert_called_once()
+            call_kwargs = mock_queue_inst.submit_tasks_batch.call_args.kwargs
+            self.assertEqual(call_kwargs.get("market_context_policy"), "disabled")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

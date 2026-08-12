@@ -25,6 +25,7 @@ from src.report_language import (
 )
 from src.market_phase_summary import extract_market_phase_summary
 from src.schemas.decision_action import build_action_fields
+from src.services.daily_market_context import MarketReviewDataUnavailableError
 from src.services.run_diagnostics import (
     activate_run_diagnostic_context,
     build_run_diagnostic_summary,
@@ -61,6 +62,7 @@ class AnalysisService:
         query_source: str = "api",
         portfolio_context: Optional[Dict[str, Any]] = None,
         report_language: Optional[str] = None,
+        market_context_policy: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         执行股票分析
@@ -116,6 +118,7 @@ class AnalysisService:
                 analysis_skills=skills,
                 analysis_phase=analysis_phase,
                 portfolio_context=portfolio_context,
+                market_context_policy=market_context_policy,
             )
             
             # 确定报告类型 (API: simple/detailed/full/brief -> ReportType)
@@ -142,6 +145,8 @@ class AnalysisService:
             # 构建响应
             return self._build_analysis_response(result, query_id, report_type=rt.value)
             
+        except MarketReviewDataUnavailableError:
+            raise
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"分析股票 {stock_code} 失败: {e}", exc_info=True)

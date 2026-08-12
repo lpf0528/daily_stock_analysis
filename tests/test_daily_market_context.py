@@ -700,7 +700,7 @@ def test_get_context_skips_generation_when_market_review_lock_is_held() -> None:
             force_refresh=True,
         )
 
-    assert context is None
+    assert context is not None and context.status == "unavailable"
     assert acquire_lock.call_count == (
         daily_market_context_module._MARKET_REVIEW_LOCK_WAIT_MAX_ATTEMPTS + 1
     )

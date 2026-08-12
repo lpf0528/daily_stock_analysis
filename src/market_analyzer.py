@@ -1999,6 +1999,7 @@ Market conditions can change quickly. The data above is for reference only and d
         self,
         budget: Optional[MarketReviewExecutionBudget] = None,
         cancellation_fn: Optional[Callable[[], bool]] = None,
+        strict_realtime_required: bool = False,
     ) -> MarketLightReviewResult:
         """Run market review once and keep report/snapshot on the same overview."""
         logger.info("========== 开始大盘复盘分析 ==========")
@@ -2015,8 +2016,7 @@ Market conditions can change quickly. The data above is for reference only and d
             raise TaskCancelledError("Market review task cancelled after overview fetch")
 
         realtime_mode = getattr(self.config, "market_review_realtime_mode", "bounded")
-        strict_orchestrator = getattr(self.config, "market_review_strict_for_orchestrator", True)
-        if (realtime_mode == "strict" or strict_orchestrator) and overview.market_context_status != "fresh":
+        if (realtime_mode == "strict" or strict_realtime_required) and overview.market_context_status != "fresh":
             from src.services.daily_market_context import MarketReviewDataUnavailableError
             logger.warning(
                 "[MarketReview] 严格模式下大盘实时数据未达合格 fresh 要求 (status=%s)，终止生成复盘报告",
@@ -2126,6 +2126,7 @@ Market conditions can change quickly. The data above is for reference only and d
         self,
         budget: Optional[MarketReviewExecutionBudget] = None,
         cancellation_fn: Optional[Callable[[], bool]] = None,
+        strict_realtime_required: bool = False,
     ) -> str:
         """
         执行每日大盘复盘流程
@@ -2133,15 +2134,24 @@ Market conditions can change quickly. The data above is for reference only and d
         Returns:
             复盘报告文本
         """
-        return self.run_daily_review_with_snapshot(budget=budget, cancellation_fn=cancellation_fn).report
+        return self.run_daily_review_with_snapshot(
+            budget=budget,
+            cancellation_fn=cancellation_fn,
+            strict_realtime_required=strict_realtime_required,
+        ).report
 
     def run_daily_review_with_snapshot(
         self,
         budget: Optional[MarketReviewExecutionBudget] = None,
         cancellation_fn: Optional[Callable[[], bool]] = None,
+        strict_realtime_required: bool = False,
     ) -> MarketLightReviewResult:
         """Run daily review and return the report plus its structured Market Light snapshot."""
-        return self._run_daily_review_parts(budget=budget, cancellation_fn=cancellation_fn)
+        return self._run_daily_review_parts(
+            budget=budget,
+            cancellation_fn=cancellation_fn,
+            strict_realtime_required=strict_realtime_required,
+        )
 
 
 # 测试入口
