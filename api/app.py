@@ -376,6 +376,8 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     # ============================================================
     
     app.include_router(api_v1_router, prefix="/api/v1")
+    # 兼容旧版无 /v1 前缀路由请求（如 /api/stocks/... -> /api/v1/stocks/...）
+    app.include_router(api_v1_router, prefix="/api", include_in_schema=False)
     add_error_handlers(app)
     
     # ============================================================

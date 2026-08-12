@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] 补全旧版无 /v1 前缀 API 路由兼容挂载与认证中间件覆盖
 - [文档] 更新 `docs/LLM_CONFIG_GUIDE.md` 与 `docs/LLM_CONFIG_GUIDE_EN.md`，新增大模型配置与搜索引擎连通性验证方法说明
 - [文档] 新增项目深度分析与上下文指南 `docs/PROJECT_ANALYSIS.md`，完整覆盖系统架构、核心模块、数据源与 Fallback 机制、Agent 编排与多端集成规范，方便每次放入上下文使用
 - [新功能] Agent Chat 按会话持久化 Skill 选择，支持刷新和会话切换恢复，并区分省略 `skills`、显式空列表与非空选择；无持久化状态的历史会话继续使用运行时默认且不会被静默转为显式选择，复用分析 `context` 中残留的 legacy `skills` / `strategies` 也不会覆盖顶层三态或会话状态，非空但全部无效的 Skill 请求不会被当成显式空列表并清空既有选择
