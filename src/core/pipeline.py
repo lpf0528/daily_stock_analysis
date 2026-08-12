@@ -1839,6 +1839,17 @@ class StockAnalysisPipeline:
         target_date: Optional[date] = None,
     ) -> Optional[DailyMarketContext]:
         """Load/generate today's market context when market review is explicitly enabled."""
+        policy = (getattr(self, "market_context_policy", None) or getattr(self.config, "market_context_policy", None) or "optional").lower()
+        if policy == "disabled":
+            return DailyMarketContext(
+                region=market,
+                trade_date=target_date or date.today(),
+                summary="[已禁用大盘上下文]",
+                source="disabled",
+                status="disabled",
+                created_at=datetime.now(),
+            )
+
         if getattr(self, "daily_market_context_enabled", True) is not True:
             return None
         if getattr(self.config, "daily_market_context_enabled", True) is not True:
@@ -1864,6 +1875,7 @@ class StockAnalysisPipeline:
                 "force_refresh": force_refresh,
                 "allow_generate": getattr(self, "daily_market_context_allow_generate", True),
                 "target_date": target_date,
+                "market_context_policy": policy,
             }
             current_query_id = getattr(self, "query_id", None)
             if isinstance(current_query_id, str) and current_query_id.strip():

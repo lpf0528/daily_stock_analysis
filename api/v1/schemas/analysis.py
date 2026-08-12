@@ -92,6 +92,11 @@ class AnalyzeRequest(BaseModel):
         description="本次分析使用的策略 skill ID 列表；兼容 legacy strategies 字段",
         json_schema_extra={"example": ["bull_trend", "growth_quality"]},
     )
+    market_context_policy: Optional[Literal["required", "optional", "disabled"]] = Field(
+        None,
+        validation_alias=AliasChoices("market_context_policy", "marketContextPolicy"),
+        description="大盘上下文依赖策略：required(必需，无/旧则失败) / optional(可选，抓取/降级) / disabled(显式禁用大盘上下文)",
+    )
 
     model_config = ConfigDict(json_schema_extra={
         "example": {

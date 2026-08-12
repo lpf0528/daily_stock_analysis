@@ -74,6 +74,7 @@ class ProviderAttempt:
         }
 
 
+
 class MarketDataResult(dict):
     """Data quality and payload container for market statistics."""
 
@@ -101,6 +102,20 @@ class MarketDataResult(dict):
 
     def __bool__(self) -> bool:
         return self.status in ("fresh", "partial") and bool(self.data)
+
+    def __iter__(self):
+        if self.data and "indices" in self.data:
+            return iter(self.data.get("indices") or [])
+        if self.data and ("top" in self.data or "bottom" in self.data):
+            return iter((self.data.get("top") or [], self.data.get("bottom") or []))
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        if self.data and "indices" in self.data:
+            return len(self.data.get("indices") or [])
+        if self.data and ("top" in self.data or "bottom" in self.data):
+            return 2
+        return super().__len__()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -449,6 +464,11 @@ def canonical_stock_code(code: str) -> str:
 
 class DataFetchError(Exception):
     """数据获取异常基类"""
+    pass
+
+
+class TaskCancelledError(DataFetchError):
+    """Raised when execution is cancelled at a sub-step checkpoint."""
     pass
 
 
@@ -2603,31 +2623,127 @@ class DataFetcherManager:
         logger.info(f"[股票名称] 批量获取完成，成功 {len(result)}/{len(stock_codes)}")
         return result
 
-    def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
-        """获取主要指数实时行情（自动切换数据源）"""
-        if region == "cn":
-            tickflow_fetcher = self._get_tickflow_fetcher()
-            if tickflow_fetcher is not None:
-                try:
-                    data = tickflow_fetcher.get_main_indices(region=region)
-                    if data:
-                        logger.info("[TickFlowFetcher] 获取指数行情成功")
-                        return data
-                except Exception as e:
-                    logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
+    def get_main_indices(
+        self,
+        region: str = "cn",
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketDataResult:
+        """获取主要指数实时行情（统一预算、按 provider 超时与 upstream 熔断）"""
+        t0 = time.monotonic()
+        exec_budget = budget or MarketReviewExecutionBudget()
+        attempts: List[ProviderAttempt] = []
+        warnings: List[str] = []
 
-        for fetcher in self._fetchers:
-            if region == "cn" and fetcher.name == "TickFlowFetcher":
+        fetchers = self._get_fetchers_snapshot()
+        for fetcher in fetchers:
+            if cancellation_fn and cancellation_fn():
+                raise TaskCancelledError("Task cancelled before fetching main indices")
+
+            prov_name_clean = fetcher.name.lower()
+            upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+            start_iso = datetime.now().isoformat()
+
+            if exec_budget.is_expired():
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="budget_exhausted",
+                    )
+                )
+                warnings.append(f"Provider '{prov_name_clean}' skipped for indices: deadline expired")
                 continue
-            try:
-                data = fetcher.get_main_indices(region=region)
-                if data:
-                    logger.info(f"[{fetcher.name}] 获取指数行情成功")
-                    return data
-            except Exception as e:
-                logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
+
+            if exec_budget.is_upstream_tripped(upstream):
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="upstream_circuit_open",
+                    )
+                )
+                warnings.append(f"Provider '{prov_name_clean}' skipped for indices: upstream '{upstream}' circuit open")
                 continue
-        return []
+
+            if not hasattr(fetcher, "get_main_indices"):
+                continue
+
+            per_timeout = exec_budget.get_provider_timeout()
+            data, err, duration_ms = self._run_with_timeout(
+                lambda f=fetcher: f.get_main_indices(region=region),
+                per_timeout,
+                f"get_main_indices({prov_name_clean})",
+            )
+
+            if err:
+                is_timeout = "timeout" in err.lower()
+                status_str = "timeout" if is_timeout else "failed"
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status=status_str,
+                        error_type=err,
+                    )
+                )
+                warnings.append(f"Provider '{prov_name_clean}' indices {status_str}: {err}")
+                if is_timeout or any(kw in err.lower() for kw in ["remotedisconnected", "curl (56)", "connection reset"]):
+                    exec_budget.trip_upstream(upstream, reason=err)
+                continue
+
+            if data and isinstance(data, list) and len(data) > 0:
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status="success",
+                    )
+                )
+                elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+                as_of_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                return MarketDataResult(
+                    status="fresh",
+                    source=fetcher.name,
+                    upstream=upstream,
+                    as_of=as_of_str,
+                    duration_ms=elapsed_total_ms,
+                    warnings=warnings,
+                    attempts=attempts,
+                    data={"indices": data},
+                )
+
+            attempts.append(
+                ProviderAttempt(
+                    provider=prov_name_clean,
+                    upstream=upstream,
+                    started_at=start_iso,
+                    duration_ms=duration_ms,
+                    status="empty",
+                )
+            )
+
+        elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+        return MarketDataResult(
+            status="unavailable",
+            source=None,
+            upstream=None,
+            as_of=None,
+            duration_ms=elapsed_total_ms,
+            warnings=warnings or ["Main indices unavailable from configured providers"],
+            attempts=attempts,
+            data=None,
+        )
 
     def _resolve_fetcher_by_name(self, name: str) -> Optional[BaseFetcher]:
         name_clean = name.strip().lower()
@@ -2655,6 +2771,7 @@ class DataFetcherManager:
         budget: Optional[MarketReviewExecutionBudget] = None,
         providers: Optional[List[str]] = None,
         config: Optional[Any] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
     ) -> MarketDataResult:
         """获取市场涨跌统计（带质量契约、按 provider 超时与 upstream 熔断）"""
         logger.info("[MarketStats] component=market_stats action=start purpose=%s", purpose)
@@ -2687,6 +2804,9 @@ class DataFetcherManager:
         warnings: List[str] = []
 
         for prov_name in allowed_provider_names:
+            if cancellation_fn and cancellation_fn():
+                raise TaskCancelledError("Task cancelled before fetching market stats")
+
             prov_name_clean = prov_name.strip().lower()
             upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
             start_iso = datetime.now().isoformat()
@@ -3806,8 +3926,8 @@ class DataFetcherManager:
             return self._get_sector_rankings_with_meta(5)
 
         rankings, err, cost_ms = self._run_with_retry(task, timeout, "boards")
-        if isinstance(rankings, tuple) and len(rankings) == 4:
-            top, bottom, chain, chain_error = rankings
+        if isinstance(rankings, tuple) and len(rankings) >= 4:
+            top, bottom, chain, chain_error = rankings[:4]
             if chain_error and not err:
                 err = chain_error
             if not top and not bottom:
@@ -3841,67 +3961,149 @@ class DataFetcherManager:
         self,
         n: int = 5,
         budget: Optional[MarketReviewExecutionBudget] = None,
-    ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str]:
-            """Get sector rankings with ordered fallback chain metadata."""
-            source_chain: List[Dict[str, Any]] = []
-            last_error = ""
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> Tuple[List[Dict], List[Dict], List[Dict[str, Any]], str, MarketDataResult]:
+        """Get sector rankings with ordered fallback chain metadata & MarketDataResult."""
+        t0 = time.monotonic()
+        exec_budget = budget or MarketReviewExecutionBudget()
+        source_chain: List[Dict[str, Any]] = []
+        attempts: List[ProviderAttempt] = []
+        warnings: List[str] = []
+        last_error = ""
 
-            # 直接遍历管理器已经按 priority 排好序的数据源列表
-            for fetcher in self._fetchers:
-                if not hasattr(fetcher, 'get_sector_rankings'):
-                    continue
+        fetchers = self._get_fetchers_snapshot()
+        for fetcher in fetchers:
+            if cancellation_fn and cancellation_fn():
+                raise TaskCancelledError("Task cancelled before fetching sector rankings")
 
-                start = time.time()
-                try:
-                    data = fetcher.get_sector_rankings(n)
-                    duration_ms = int((time.time() - start) * 1000)
-                    if data and data[0] is not None and data[1] is not None:
-                        source_chain.append(
-                            {
-                                "provider": fetcher.name,
-                                "result": "ok",
-                                "duration_ms": duration_ms,
-                            }
-                        )
-                        logger.info(f"[{fetcher.name}] 获取板块排行成功")
-                        return data[0], data[1], source_chain, ""
+            if not hasattr(fetcher, 'get_sector_rankings'):
+                continue
 
-                    last_error = f"{fetcher.name}返回空结果"
-                    source_chain.append(
-                        {
-                            "provider": fetcher.name,
-                            "result": "empty",
-                            "duration_ms": duration_ms,
-                            "error": last_error,
-                        }
+            prov_name_clean = fetcher.name.lower()
+            upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+            start_iso = datetime.now().isoformat()
+
+            if exec_budget.is_expired():
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="budget_exhausted",
                     )
-                except Exception as e:
-                    error_type, error_reason = summarize_exception(e)
-                    last_error = f"{fetcher.name} ({error_type}) {error_reason}"
-                    duration_ms = int((time.time() - start) * 1000)
-                    source_chain.append(
-                        {
-                            "provider": fetcher.name,
-                            "result": "failed",
-                            "duration_ms": duration_ms,
-                            "error": error_reason,
-                        }
-                    )
-                    logger.warning(f"[{fetcher.name}] 获取板块排行失败: {error_reason}")
+                )
+                source_chain.append({"provider": fetcher.name, "result": "skipped", "duration_ms": 0, "error": "budget_exhausted"})
+                warnings.append(f"Provider '{prov_name_clean}' skipped for sector rankings: deadline expired")
+                continue
 
-            return [], [], source_chain, last_error
+            if exec_budget.is_upstream_tripped(upstream):
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=0,
+                        status="skipped",
+                        error_type="upstream_circuit_open",
+                    )
+                )
+                source_chain.append({"provider": fetcher.name, "result": "skipped", "duration_ms": 0, "error": "upstream_circuit_open"})
+                warnings.append(f"Provider '{prov_name_clean}' skipped for sector rankings: upstream '{upstream}' circuit open")
+                continue
+
+            per_timeout = exec_budget.get_provider_timeout()
+            data, err, duration_ms = self._run_with_timeout(
+                lambda f=fetcher: f.get_sector_rankings(n),
+                per_timeout,
+                f"get_sector_rankings({prov_name_clean})",
+            )
+
+            if err:
+                is_timeout = "timeout" in err.lower()
+                status_str = "timeout" if is_timeout else "failed"
+                last_error = f"{fetcher.name} ({status_str}) {err}"
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status=status_str,
+                        error_type=err,
+                    )
+                )
+                source_chain.append({"provider": fetcher.name, "result": status_str, "duration_ms": duration_ms, "error": err})
+                warnings.append(f"Provider '{prov_name_clean}' sector rankings {status_str}: {err}")
+                if is_timeout or any(kw in err.lower() for kw in ["remotedisconnected", "curl (56)", "connection reset"]):
+                    exec_budget.trip_upstream(upstream, reason=err)
+                continue
+
+            if data and data[0] is not None and data[1] is not None and (data[0] or data[1]):
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status="success",
+                    )
+                )
+                source_chain.append({"provider": fetcher.name, "result": "ok", "duration_ms": duration_ms})
+                logger.info(f"[{fetcher.name}] 获取板块排行成功")
+                elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+                as_of_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                result_obj = MarketDataResult(
+                    status="fresh",
+                    source=fetcher.name,
+                    upstream=upstream,
+                    as_of=as_of_str,
+                    duration_ms=elapsed_total_ms,
+                    warnings=warnings,
+                    attempts=attempts,
+                    data={"top": data[0], "bottom": data[1]},
+                )
+                return data[0], data[1], source_chain, "", result_obj
+
+            last_error = f"{fetcher.name}返回空结果"
+            source_chain.append({"provider": fetcher.name, "result": "empty", "duration_ms": duration_ms, "error": last_error})
+            attempts.append(
+                ProviderAttempt(
+                    provider=prov_name_clean,
+                    upstream=upstream,
+                    started_at=start_iso,
+                    duration_ms=duration_ms,
+                    status="empty",
+                )
+            )
+
+        elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+        result_obj = MarketDataResult(
+            status="unavailable",
+            source=None,
+            upstream=None,
+            as_of=None,
+            duration_ms=elapsed_total_ms,
+            warnings=warnings or ["Sector rankings unavailable from configured providers"],
+            attempts=attempts,
+            data=None,
+        )
+        return [], [], source_chain, last_error, result_obj
 
     def get_sector_rankings(
         self,
         n: int = 5,
         budget: Optional[MarketReviewExecutionBudget] = None,
-    ) -> Tuple[List[Dict], List[Dict]]:
-        """获取板块涨跌榜（自动切换数据源）"""
-        top, bottom, _, last_error = self._get_sector_rankings_with_meta(n, budget=budget)
-        if top or bottom:
-            return top, bottom
-        logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
-        return [], []
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketDataResult:
+        """获取板块涨跌榜（自动切换数据源，返回 MarketDataResult 且支持 (top, bottom) 解包）"""
+        top, bottom, _, last_error, result_obj = self._get_sector_rankings_with_meta(
+            n, budget=budget, cancellation_fn=cancellation_fn,
+        )
+        if not top and not bottom and last_error:
+            logger.warning(f"[板块排行] 所有数据源均失败，最终错误: {last_error}")
+        return result_obj
 
     @staticmethod
     def _copy_ranking_rows(rows: List[Dict]) -> List[Dict]:
@@ -3916,8 +4118,14 @@ class DataFetcherManager:
         self,
         n: int = 5,
         budget: Optional[MarketReviewExecutionBudget] = None,
-    ) -> Tuple[List[Dict], List[Dict]]:
-        """获取概念/题材涨跌榜（自动切换数据源）。"""
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketDataResult:
+        """获取概念/题材涨跌榜（统一预算、超时与熔断控制，返回 MarketDataResult）。"""
+        t0 = time.monotonic()
+        exec_budget = budget or MarketReviewExecutionBudget()
+        attempts: List[ProviderAttempt] = []
+        warnings: List[str] = []
+
         try:
             normalized_n = int(n)
         except (TypeError, ValueError):
@@ -3925,30 +4133,149 @@ class DataFetcherManager:
         if normalized_n <= 0:
             normalized_n = 5
 
-        last_error = ""
         now = time.monotonic()
-
         with self.__class__._concept_rankings_cache_lock:
             cached = self.__class__._concept_rankings_cache.get(normalized_n)
             if cached and cached[0] > now:
                 logger.debug("[概念排行] 命中共享缓存 n=%s", normalized_n)
-                return self._copy_ranking_rows(cached[1]), self._copy_ranking_rows(cached[2])
+                top = self._copy_ranking_rows(cached[1])
+                bottom = self._copy_ranking_rows(cached[2])
+                return MarketDataResult(
+                    status="fresh",
+                    source="cache",
+                    upstream="cache",
+                    as_of=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    duration_ms=0,
+                    warnings=[],
+                    attempts=[],
+                    data={"top": top, "bottom": bottom},
+                )
 
             top: List[Dict] = []
             bottom: List[Dict] = []
-            for fetcher in self._get_fetchers_snapshot():
-                try:
-                    data = fetcher.get_concept_rankings(normalized_n)
-                    if data and (data[0] or data[1]):
-                        top = data[0] or []
-                        bottom = data[1] or []
-                        logger.info(f"[{fetcher.name}] 获取概念排行成功")
-                        break
-                    last_error = f"{fetcher.name}返回空结果"
-                except Exception as e:
-                    error_type, error_reason = summarize_exception(e)
-                    last_error = f"{fetcher.name} ({error_type}) {error_reason}"
-                    logger.warning(f"[{fetcher.name}] 获取概念排行失败: {error_reason}")
+            last_error = ""
+
+            fetchers = self._get_fetchers_snapshot()
+            for fetcher in fetchers:
+                if cancellation_fn and cancellation_fn():
+                    raise TaskCancelledError("Task cancelled before fetching concept rankings")
+
+                if not hasattr(fetcher, 'get_concept_rankings'):
+                    continue
+
+                prov_name_clean = fetcher.name.lower()
+                upstream = PROVIDER_UPSTREAM_MAP.get(prov_name_clean, prov_name_clean)
+                start_iso = datetime.now().isoformat()
+
+                if exec_budget.is_expired():
+                    attempts.append(
+                        ProviderAttempt(
+                            provider=prov_name_clean,
+                            upstream=upstream,
+                            started_at=start_iso,
+                            duration_ms=0,
+                            status="skipped",
+                            error_type="budget_exhausted",
+                        )
+                    )
+                    warnings.append(f"Provider '{prov_name_clean}' skipped for concept rankings: deadline expired")
+                    continue
+
+                if exec_budget.is_upstream_tripped(upstream):
+                    attempts.append(
+                        ProviderAttempt(
+                            provider=prov_name_clean,
+                            upstream=upstream,
+                            started_at=start_iso,
+                            duration_ms=0,
+                            status="skipped",
+                            error_type="upstream_circuit_open",
+                        )
+                    )
+                    warnings.append(f"Provider '{prov_name_clean}' skipped for concept rankings: upstream '{upstream}' circuit open")
+                    continue
+
+                per_timeout = exec_budget.get_provider_timeout()
+                data, err, duration_ms = self._run_with_timeout(
+                    lambda f=fetcher: f.get_concept_rankings(normalized_n),
+                    per_timeout,
+                    f"get_concept_rankings({prov_name_clean})",
+                )
+
+                if err:
+                    is_timeout = "timeout" in err.lower()
+                    status_str = "timeout" if is_timeout else "failed"
+                    last_error = f"{fetcher.name} ({status_str}) {err}"
+                    attempts.append(
+                        ProviderAttempt(
+                            provider=prov_name_clean,
+                            upstream=upstream,
+                            started_at=start_iso,
+                            duration_ms=duration_ms,
+                            status=status_str,
+                            error_type=err,
+                        )
+                    )
+                    warnings.append(f"Provider '{prov_name_clean}' concept rankings {status_str}: {err}")
+                    if is_timeout or any(kw in err.lower() for kw in ["remotedisconnected", "curl (56)", "connection reset"]):
+                        exec_budget.trip_upstream(upstream, reason=err)
+                    continue
+
+                if data and (data[0] or data[1]):
+                    top = data[0] or []
+                    bottom = data[1] or []
+                    attempts.append(
+                        ProviderAttempt(
+                            provider=prov_name_clean,
+                            upstream=upstream,
+                            started_at=start_iso,
+                            duration_ms=duration_ms,
+                            status="success",
+                        )
+                    )
+                    logger.info(f"[{fetcher.name}] 获取概念排行成功")
+                    break
+
+                last_error = f"{fetcher.name}返回空结果"
+                attempts.append(
+                    ProviderAttempt(
+                        provider=prov_name_clean,
+                        upstream=upstream,
+                        started_at=start_iso,
+                        duration_ms=duration_ms,
+                        status="empty",
+                    )
+                )
+
+            if not top and not bottom and last_error:
+                logger.warning(f"[概念排行] 所有数据源均失败，最终错误: {last_error}")
+
+            ttl = (
+                self.__class__._CONCEPT_RANKINGS_CACHE_TTL_SECONDS
+                if top or bottom
+                else self.__class__._CONCEPT_RANKINGS_EMPTY_CACHE_TTL_SECONDS
+            )
+            cached_top = self._copy_ranking_rows(top)
+            cached_bottom = self._copy_ranking_rows(bottom)
+            self.__class__._concept_rankings_cache[normalized_n] = (
+                time.monotonic() + ttl,
+                cached_top,
+                cached_bottom,
+            )
+
+            elapsed_total_ms = int((time.monotonic() - t0) * 1000)
+            status_val = "fresh" if (top or bottom) else "unavailable"
+            as_of_val = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if (top or bottom) else None
+            return MarketDataResult(
+                status=status_val,
+                source="fetcher" if (top or bottom) else None,
+                upstream=attempts[-1].upstream if attempts else None,
+                as_of=as_of_val,
+                duration_ms=elapsed_total_ms,
+                warnings=warnings,
+                attempts=attempts,
+                data={"top": top, "bottom": bottom} if (top or bottom) else None,
+            )
 
             if not top and not bottom and last_error:
                 logger.warning(f"[概念排行] 所有数据源均失败，最终错误: {last_error}")

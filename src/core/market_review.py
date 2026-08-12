@@ -31,6 +31,7 @@ from src.services.run_diagnostics import (
     record_notification_run,
 )
 from src.schemas.market_light import MARKET_LIGHT_REGIONS
+from data_provider.base import TaskCancelledError
 from src.services.daily_market_context import MarketReviewDataUnavailableError
 from src.utils.market_review_region import (
     MARKET_REVIEW_REGION_ORDER,
@@ -185,6 +186,7 @@ def run_market_review(
     save_report_file: bool = True,
     persist_history: bool = True,
     trigger_source: str = "cli",
+    cancellation_fn: Optional[Any] = None,
 ) -> Optional[str] | Optional[MarketReviewRunResult]:
     """
     执行大盘复盘分析
@@ -201,6 +203,7 @@ def run_market_review(
         save_report_file: 是否保存 Markdown 文件；上下文生成路径可关闭以避免多区域临时复盘互相覆盖
         persist_history: 是否写入 analysis_history；预热路径可关闭以避免覆盖用户可见的同日大盘复盘记录
         trigger_source: 触发来源，用于日志排障（cli/schedule/api/bot/service 等）
+        cancellation_fn: 可选的取消检查回调
 
     Returns:
         复盘报告文本
@@ -245,7 +248,7 @@ def run_market_review(
                     region=mkt,
                     config=runtime_config,
                 )
-                review_result = mkt_analyzer.run_daily_review_with_snapshot()
+                review_result = mkt_analyzer.run_daily_review_with_snapshot(cancellation_fn=cancellation_fn)
                 mkt_report = review_result.report
                 _collect_market_light_snapshot(
                     market_light_snapshots,
@@ -283,7 +286,7 @@ def run_market_review(
                 region=run_region,
                 config=runtime_config,
             )
-            review_result = market_analyzer.run_daily_review_with_snapshot()
+            review_result = market_analyzer.run_daily_review_with_snapshot(cancellation_fn=cancellation_fn)
             review_report = review_result.report
             market_light_snapshots = {}
             _collect_market_light_snapshot(
@@ -305,11 +308,12 @@ def run_market_review(
 
         if is_strict:
             for mkt_key, mkt_payload in market_review_payloads.items():
-                if mkt_key == "cn" and mkt_payload.get("market_context_status") == "unavailable":
+                status = mkt_payload.get("market_context_status") or "fresh"
+                if status == "unavailable" or (mkt_key == "cn" and status not in ("fresh", "partial")):
                     diag = mkt_payload.get("data_quality", {})
-                    logger.warning("[MarketReview] 严格模式下大盘实时统计不可用，触发终止: region=%s diag=%s", mkt_key, diag)
+                    logger.warning("[MarketReview] 严格模式下大盘数据质量未达到合格要求，触发终止: region=%s status=%s diag=%s", mkt_key, status, diag)
                     raise MarketReviewDataUnavailableError(
-                        f"大盘复盘 [{mkt_key}] 实时市场统计数据不可用 (status=unavailable)，已终止任务。",
+                        f"大盘复盘 [{mkt_key}] 实时市场数据未达到合格要求 (status={status})，已终止任务。",
                         diagnostics=diag,
                     )
         
@@ -454,7 +458,7 @@ def run_market_review(
                 return merge_markdown_report
             return review_report
         
-    except (GenerationError, MarketReviewDataUnavailableError):
+    except (GenerationError, MarketReviewDataUnavailableError, TaskCancelledError):
         logger.exception(
             "[MarketReview] component=market_review action=failed "
             "trigger_source=%s query_id=%s region=%s",
@@ -484,6 +488,7 @@ def _coerce_market_review_payload(
     payload = getattr(review_result, "structured_payload", None)
     if isinstance(payload, dict) and payload:
         return payload
+    overview = getattr(review_result, "overview", None)
     return {
         "version": 1,
         "kind": MARKET_REVIEW_REPORT_TYPE,
@@ -491,6 +496,8 @@ def _coerce_market_review_payload(
         "title": "",
         "sections": [{"key": "full_review", "title": "Review", "markdown": report or ""}],
         "markdown_report": report or "",
+        "market_context_status": getattr(overview, "market_context_status", "fresh"),
+        "data_quality": getattr(overview, "data_quality", {}),
     }
 
 

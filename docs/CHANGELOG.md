@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - [修复] 消除大盘复盘实时统计失败引发的系统卡死与无限等待：增加执行时间预算与超时管理（`MARKET_REVIEW_TOTAL_TIMEOUT_SECONDS` / `MARKET_REVIEW_PROVIDER_TIMEOUT_SECONDS`），实现 EastMoney 等上游网络断连的快速熔断避让与 `MarketDataResult` 数据质量元数据追踪，增加严格/降级模式区分（`MARKET_REVIEW_REALTIME_MODE`）与 `MarketReviewDataUnavailableError` 显式失败机制，提供 `POST /api/v1/analysis/tasks/{task_id}/cancel` 任务取消 API。
+- [修复] 完成大盘复盘实时统计修复：补齐 `indices`、`market_stats`、`sector_rankings`、`concept_rankings` 统一 `MarketReviewExecutionBudget` 预算、单 provider 超时与熔断控制，强化严格模式下全实时组件质量检查与 `MarketReviewDataUnavailableError` 终止机制，规范缓存与 `disabled` 策略，支持单股 API `market_context_policy`，并在市场复盘各子步骤下沉取消检查点（`cancellation_fn`）。
 - [改进] 补全旧版无 /v1 前缀 API 路由兼容挂载与认证中间件覆盖
 - [文档] 更新 `docs/LLM_CONFIG_GUIDE.md` 与 `docs/LLM_CONFIG_GUIDE_EN.md`，新增大模型配置与搜索引擎连通性验证方法说明
 - [文档] 新增项目深度分析与上下文指南 `docs/PROJECT_ANALYSIS.md`，完整覆盖系统架构、核心模块、数据源与 Fallback 机制、Agent 编排与多端集成规范，方便每次放入上下文使用

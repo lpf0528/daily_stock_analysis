@@ -1202,7 +1202,8 @@ class Config:
     market_review_provider_timeout_seconds: int = 5
     market_review_stats_providers: List[str] = field(default_factory=lambda: ["tickflow", "tushare", "sina"])
     market_review_strict_for_orchestrator: bool = True
-    market_review_allow_stale_cache_seconds: int = 0
+    market_review_allow_stale_cache_seconds: int = 3600
+    market_context_policy: str = "optional"  # required | optional | disabled
     # 交易日检查：默认启用，非交易日跳过执行；设为 false 或 --force-run 可强制执行（Issue #373）
     trading_day_check_enabled: bool = True
 
@@ -2178,8 +2179,9 @@ class Config:
             ),
             market_review_strict_for_orchestrator=os.getenv('MARKET_REVIEW_STRICT_FOR_ORCHESTRATOR', 'true').lower() == 'true',
             market_review_allow_stale_cache_seconds=parse_env_int(
-                os.getenv('MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS'), 0, field_name='MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS', minimum=0
+                os.getenv('MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS'), 3600, field_name='MARKET_REVIEW_ALLOW_STALE_CACHE_SECONDS', minimum=0
             ),
+            market_context_policy=os.getenv('MARKET_CONTEXT_POLICY', 'optional').lower(),
             trading_day_check_enabled=os.getenv('TRADING_DAY_CHECK_ENABLED', 'true').lower() != 'false',
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),

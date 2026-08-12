@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from inspect import getattr_static
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 
 import pandas as pd
 
@@ -111,6 +111,22 @@ class MarketOverview:
     warnings: List[str] = field(default_factory=list)
     attempts: List[Dict[str, Any]] = field(default_factory=list)
     market_stats_result: Optional[Any] = None
+
+    indices_status: str = "fresh"
+    indices_as_of: Optional[str] = None
+    indices_attempts: List[Dict[str, Any]] = field(default_factory=list)
+
+    market_stats_status: str = "fresh"
+    market_stats_as_of: Optional[str] = None
+    market_stats_attempts: List[Dict[str, Any]] = field(default_factory=list)
+
+    sector_rankings_status: str = "fresh"
+    sector_rankings_as_of: Optional[str] = None
+    sector_rankings_attempts: List[Dict[str, Any]] = field(default_factory=list)
+
+    concept_rankings_status: str = "fresh"
+    concept_rankings_as_of: Optional[str] = None
+    concept_rankings_attempts: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -432,9 +448,10 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
     def get_market_overview(
         self,
         budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
     ) -> MarketOverview:
         """
-        获取市场概览数据（带时间预算与上游熔断控制）
+        获取市场概览数据（带时间预算、取消检查与上游熔断控制）
         
         Returns:
             MarketOverview: 市场概览数据对象
@@ -452,57 +469,121 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
 
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
-        overview.indices = self._get_main_indices()
+        self._get_main_indices(overview, budget=exec_budget, cancellation_fn=cancellation_fn)
 
         # 2. 获取涨跌统计（A 股有，美股无等效数据）
         if self.profile.has_market_stats:
-            self._get_market_statistics(overview, budget=exec_budget)
+            self._get_market_statistics(overview, budget=exec_budget, cancellation_fn=cancellation_fn)
         else:
-            overview.market_context_status = "fresh"
+            overview.market_stats_status = "fresh"
 
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
-            self._get_sector_rankings(overview, budget=exec_budget)
-            self._get_concept_rankings(overview, budget=exec_budget)
+            self._get_sector_rankings(overview, budget=exec_budget, cancellation_fn=cancellation_fn)
+            self._get_concept_rankings(overview, budget=exec_budget, cancellation_fn=cancellation_fn)
+        else:
+            overview.sector_rankings_status = "fresh"
+            overview.concept_rankings_status = "fresh"
+
+        # 4. 汇总各必需字段质量与 overall status
+        req_statuses = [overview.indices_status]
+        if self.profile.has_market_stats:
+            req_statuses.append(overview.market_stats_status)
+        if self.profile.has_sector_rankings:
+            req_statuses.append(overview.sector_rankings_status)
+            req_statuses.append(overview.concept_rankings_status)
+
+        if any(s == "unavailable" for s in req_statuses):
+            overview.market_context_status = "unavailable"
+        elif any(s == "stale" for s in req_statuses):
+            overview.market_context_status = "stale"
+        elif any(s == "partial" for s in req_statuses):
+            overview.market_context_status = "partial"
+        else:
+            overview.market_context_status = "fresh"
+
+        overview.as_of = overview.indices_as_of or overview.market_stats_as_of or overview.sector_rankings_as_of or overview.concept_rankings_as_of
 
         overview.data_quality = {
             "status": overview.market_context_status,
             "as_of": overview.as_of,
+            "components": {
+                "indices": {
+                    "status": overview.indices_status,
+                    "as_of": overview.indices_as_of,
+                    "attempts": overview.indices_attempts,
+                },
+                "market_stats": {
+                    "status": overview.market_stats_status,
+                    "as_of": overview.market_stats_as_of,
+                    "attempts": overview.market_stats_attempts,
+                },
+                "sector_rankings": {
+                    "status": overview.sector_rankings_status,
+                    "as_of": overview.sector_rankings_as_of,
+                    "attempts": overview.sector_rankings_attempts,
+                },
+                "concept_rankings": {
+                    "status": overview.concept_rankings_status,
+                    "as_of": overview.concept_rankings_as_of,
+                    "attempts": overview.concept_rankings_attempts,
+                },
+            },
             "warnings": overview.warnings,
             "attempts": overview.attempts,
         }
 
         return overview
 
-    def _get_main_indices(self) -> List[MarketIndex]:
+    def _get_main_indices(
+        self,
+        overview: MarketOverview,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> List[MarketIndex]:
         """获取主要指数实时行情"""
         indices = []
 
         try:
             logger.info("[大盘] %s action=get_main_indices status=start", self._log_context())
 
-            # 使用 DataFetcherManager 获取指数行情（按 region 切换）
-            data_list = self.data_manager.get_main_indices(region=self.region)
+            res = self.data_manager.get_main_indices(
+                region=self.region,
+                budget=budget,
+                cancellation_fn=cancellation_fn,
+            )
+
+            if hasattr(res, "to_dict"):
+                overview.warnings.extend(getattr(res, "warnings", []))
+                overview.attempts.extend([a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])])
+                overview.indices_status = getattr(res, "status", "unavailable")
+                overview.indices_as_of = getattr(res, "as_of", None)
+                overview.indices_attempts = [a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])]
+
+            data_list = res.data.get("indices", []) if hasattr(res, "data") and isinstance(res.data, dict) else list(res)
 
             if data_list:
                 for item in data_list:
-                    index = MarketIndex(
-                        code=item['code'],
-                        name=item['name'],
-                        current=item['current'],
-                        change=item['change'],
-                        change_pct=item['change_pct'],
-                        open=item['open'],
-                        high=item['high'],
-                        low=item['low'],
-                        prev_close=item['prev_close'],
-                        volume=item['volume'],
-                        amount=item['amount'],
-                        amplitude=item['amplitude']
-                    )
-                    indices.append(index)
+                    if isinstance(item, dict):
+                        index = MarketIndex(
+                            code=item.get('code', ''),
+                            name=item.get('name', ''),
+                            current=item.get('current', 0.0),
+                            change=item.get('change', 0.0),
+                            change_pct=item.get('change_pct', 0.0),
+                            open=item.get('open', 0.0),
+                            high=item.get('high', 0.0),
+                            low=item.get('low', 0.0),
+                            prev_close=item.get('prev_close', 0.0),
+                            volume=item.get('volume', 0.0),
+                            amount=item.get('amount', 0.0),
+                            amplitude=item.get('amplitude', 0.0)
+                        )
+                        indices.append(index)
 
+            overview.indices = indices
             if not indices:
+                overview.indices_status = "unavailable"
                 logger.warning("[大盘] %s action=get_main_indices status=empty", self._log_context())
             else:
                 logger.info(
@@ -512,11 +593,20 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 )
 
         except Exception as e:
+            if type(e).__name__ == "TaskCancelledError":
+                raise
+            overview.indices_status = "unavailable"
+            overview.warnings.append(f"Main indices exception: {e}")
             logger.error("[大盘] %s action=get_main_indices status=failed error=%s", self._log_context(), e)
 
         return indices
 
-    def _get_market_statistics(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
+    def _get_market_statistics(
+        self,
+        overview: MarketOverview,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ):
         """获取市场涨跌统计"""
         try:
             logger.info("[大盘] %s action=get_market_stats status=start", self._log_context())
@@ -525,12 +615,16 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 purpose=f"market_review:{self.region}",
                 budget=budget,
                 config=self.config,
+                cancellation_fn=cancellation_fn,
             )
             overview.market_stats_result = stats
 
             if hasattr(stats, "to_dict"):
                 overview.warnings.extend(getattr(stats, "warnings", []))
                 overview.attempts.extend([a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(stats, "attempts", [])])
+                overview.market_stats_status = getattr(stats, "status", "unavailable")
+                overview.market_stats_as_of = getattr(stats, "as_of", None)
+                overview.market_stats_attempts = [a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(stats, "attempts", [])]
 
             if stats and getattr(stats, "status", "fresh") in ("fresh", "partial"):
                 overview.up_count = stats.get('up_count', 0)
@@ -539,8 +633,6 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 overview.limit_up_count = stats.get('limit_up_count', 0)
                 overview.limit_down_count = stats.get('limit_down_count', 0)
                 overview.total_amount = stats.get('total_amount', 0.0)
-                overview.market_context_status = getattr(stats, "status", "fresh")
-                overview.as_of = getattr(stats, "as_of", None)
 
                 logger.info(
                     "[大盘] %s action=get_market_stats status=success up=%s down=%s flat=%s "
@@ -552,30 +644,54 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     overview.limit_up_count,
                     overview.limit_down_count,
                     overview.total_amount,
-                    overview.market_context_status,
+                    overview.market_stats_status,
                 )
             else:
-                overview.market_context_status = "unavailable"
+                overview.market_stats_status = "unavailable"
                 msg = "实时市场涨跌统计未取得（数据源不可用或在预算内超时）"
                 if msg not in overview.warnings:
                     overview.warnings.append(msg)
                 logger.warning("[大盘] %s action=get_market_stats status=unavailable warnings=%s", self._log_context(), overview.warnings)
 
         except Exception as e:
-            overview.market_context_status = "unavailable"
+            if type(e).__name__ == "TaskCancelledError":
+                raise
+            overview.market_stats_status = "unavailable"
             overview.warnings.append(f"Market stats exception: {e}")
             logger.error("[大盘] %s action=get_market_stats status=failed error=%s", self._log_context(), e)
 
-    def _get_sector_rankings(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
+    def _get_sector_rankings(
+        self,
+        overview: MarketOverview,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ):
         """获取板块涨跌榜"""
         try:
             logger.info("[大盘] %s action=get_sector_rankings status=start", self._log_context())
 
-            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5, budget=budget)
+            res = self.data_manager.get_sector_rankings(5, budget=budget, cancellation_fn=cancellation_fn)
+
+            if hasattr(res, "to_dict"):
+                overview.warnings.extend(getattr(res, "warnings", []))
+                overview.attempts.extend([a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])])
+                overview.sector_rankings_status = getattr(res, "status", "unavailable")
+                overview.sector_rankings_as_of = getattr(res, "as_of", None)
+                overview.sector_rankings_attempts = [a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])]
+
+            if hasattr(res, "data") and isinstance(res.data, dict):
+                top_sectors = res.data.get("top", [])
+                bottom_sectors = res.data.get("bottom", [])
+            elif isinstance(res, tuple) and len(res) == 2:
+                top_sectors, bottom_sectors = res
+            else:
+                top_sectors, bottom_sectors = [], []
 
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
                 overview.bottom_sectors = bottom_sectors
+                if not overview.sector_rankings_status:
+                    overview.sector_rankings_status = "fresh"
 
                 logger.info(
                     "[大盘] %s action=get_sector_rankings status=success top=%s bottom=%s",
@@ -584,21 +700,47 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     [s['name'] for s in overview.bottom_sectors],
                 )
             else:
+                overview.sector_rankings_status = "unavailable"
                 logger.warning("[大盘] %s action=get_sector_rankings status=empty", self._log_context())
 
         except Exception as e:
+            if type(e).__name__ == "TaskCancelledError":
+                raise
+            overview.sector_rankings_status = "unavailable"
             logger.error("[大盘] %s action=get_sector_rankings status=failed error=%s", self._log_context(), e)
 
-    def _get_concept_rankings(self, overview: MarketOverview, budget: Optional[MarketReviewExecutionBudget] = None):
+    def _get_concept_rankings(
+        self,
+        overview: MarketOverview,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ):
         """获取概念/题材涨跌榜（fail-open）。"""
         try:
             logger.info("[大盘] %s action=get_concept_rankings status=start", self._log_context())
 
-            top_concepts, bottom_concepts = self.data_manager.get_concept_rankings(5, budget=budget)
+            res = self.data_manager.get_concept_rankings(5, budget=budget, cancellation_fn=cancellation_fn)
+
+            if hasattr(res, "to_dict"):
+                overview.warnings.extend(getattr(res, "warnings", []))
+                overview.attempts.extend([a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])])
+                overview.concept_rankings_status = getattr(res, "status", "unavailable")
+                overview.concept_rankings_as_of = getattr(res, "as_of", None)
+                overview.concept_rankings_attempts = [a.to_dict() if hasattr(a, "to_dict") else a for a in getattr(res, "attempts", [])]
+
+            if hasattr(res, "data") and isinstance(res.data, dict):
+                top_concepts = res.data.get("top", [])
+                bottom_concepts = res.data.get("bottom", [])
+            elif isinstance(res, tuple) and len(res) == 2:
+                top_concepts, bottom_concepts = res
+            else:
+                top_concepts, bottom_concepts = [], []
 
             if top_concepts or bottom_concepts:
                 overview.top_concepts = top_concepts
                 overview.bottom_concepts = bottom_concepts
+                if not overview.concept_rankings_status:
+                    overview.concept_rankings_status = "fresh"
 
                 logger.info(
                     "[大盘] %s action=get_concept_rankings status=success top=%s bottom=%s",
@@ -607,9 +749,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                     [s.get('name') for s in overview.bottom_concepts],
                 )
             else:
+                overview.concept_rankings_status = "unavailable"
                 logger.warning("[大盘] %s action=get_concept_rankings status=empty", self._log_context())
 
         except Exception as e:
+            if type(e).__name__ == "TaskCancelledError":
+                raise
+            overview.concept_rankings_status = "unavailable"
             logger.warning("[大盘] %s action=get_concept_rankings status=failed error=%s", self._log_context(), e)
     
     # def _get_north_flow(self, overview: MarketOverview):
@@ -1849,26 +1995,45 @@ Market conditions can change quickly. The data above is for reference only and d
 *复盘时间: {datetime.now().strftime('%H:%M')}*
 """
     
-    def _run_daily_review_parts(self) -> MarketLightReviewResult:
+    def _run_daily_review_parts(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketLightReviewResult:
         """Run market review once and keep report/snapshot on the same overview."""
         logger.info("========== 开始大盘复盘分析 ==========")
 
+        if cancellation_fn and cancellation_fn():
+            from data_provider.base import TaskCancelledError
+            raise TaskCancelledError("Market review task cancelled before overview fetch")
+
         # 1. 获取市场概览
-        overview = self.get_market_overview()
+        overview = self.get_market_overview(budget=budget, cancellation_fn=cancellation_fn)
+
+        if cancellation_fn and cancellation_fn():
+            from data_provider.base import TaskCancelledError
+            raise TaskCancelledError("Market review task cancelled after overview fetch")
 
         realtime_mode = getattr(self.config, "market_review_realtime_mode", "bounded")
         strict_orchestrator = getattr(self.config, "market_review_strict_for_orchestrator", True)
-        if (realtime_mode == "strict" or strict_orchestrator) and overview.market_context_status == "unavailable" and self.region == "cn":
+        if (realtime_mode == "strict" or strict_orchestrator) and overview.market_context_status != "fresh":
             from src.services.daily_market_context import MarketReviewDataUnavailableError
-            logger.warning("[MarketReview] 严格模式下大盘实时统计不可用 (status=unavailable)，终止生成复盘报告")
+            logger.warning(
+                "[MarketReview] 严格模式下大盘实时数据未达合格 fresh 要求 (status=%s)，终止生成复盘报告",
+                overview.market_context_status,
+            )
             raise MarketReviewDataUnavailableError(
-                f"大盘复盘 [{self.region}] 实时市场统计不可用 (status=unavailable)，已被严格模式阻断。",
+                f"大盘复盘 [{self.region}] 实时市场数据未达到合格要求 (status={overview.market_context_status})，已被严格模式阻断。",
                 diagnostics=overview.data_quality,
             )
 
         # 2. 搜索市场新闻
         news = self.search_market_news()
         news = self._merge_persisted_market_intelligence(news)
+
+        if cancellation_fn and cancellation_fn():
+            from data_provider.base import TaskCancelledError
+            raise TaskCancelledError("Market review task cancelled before report generation")
 
         # 3. 生成复盘报告
         report = self.generate_market_review(overview, news)
@@ -1888,6 +2053,27 @@ Market conditions can change quickly. The data above is for reference only and d
             market_light_snapshot=snapshot,
             structured_payload=structured_payload,
         )
+
+    def run_daily_review(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        """
+        执行每日大盘复盘流程
+
+        Returns:
+            复盘报告文本
+        """
+        return self.run_daily_review_with_snapshot(budget=budget, cancellation_fn=cancellation_fn).report
+
+    def run_daily_review_with_snapshot(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketLightReviewResult:
+        """Run daily review and return the report plus its structured Market Light snapshot."""
+        return self._run_daily_review_parts(budget=budget, cancellation_fn=cancellation_fn)
 
     def _merge_persisted_market_intelligence(self, news: List) -> List:
         """Merge local persisted market intelligence and search news with bounded prompt/payload slot preservation."""
@@ -1936,18 +2122,26 @@ Market conditions can change quickly. The data above is for reference only and d
                 merged_search_index += 1
         return merged_news
 
-    def run_daily_review(self) -> str:
+    def run_daily_review(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> str:
         """
         执行每日大盘复盘流程
 
         Returns:
             复盘报告文本
         """
-        return self.run_daily_review_with_snapshot().report
+        return self.run_daily_review_with_snapshot(budget=budget, cancellation_fn=cancellation_fn).report
 
-    def run_daily_review_with_snapshot(self) -> MarketLightReviewResult:
+    def run_daily_review_with_snapshot(
+        self,
+        budget: Optional[MarketReviewExecutionBudget] = None,
+        cancellation_fn: Optional[Callable[[], bool]] = None,
+    ) -> MarketLightReviewResult:
         """Run daily review and return the report plus its structured Market Light snapshot."""
-        return self._run_daily_review_parts()
+        return self._run_daily_review_parts(budget=budget, cancellation_fn=cancellation_fn)
 
 
 # 测试入口

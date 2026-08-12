@@ -839,6 +839,14 @@ class AnalysisTaskQueue:
 
             return task.copy(), False
 
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """Check if a background task has been cancelled or requested for cancellation."""
+        with self._data_lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return False
+            return task.status in (TaskStatus.CANCEL_REQUESTED, TaskStatus.CANCELLED)
+
     def _execute_background_task(
         self,
         task_id: str,
@@ -918,6 +926,17 @@ class AnalysisTaskQueue:
 
         except Exception as e:  # pragma: no cover - behavior verified in downstream tests
             error_msg = str(e)
+            if type(e).__name__ == "TaskCancelledError":
+                with self._data_lock:
+                    task = self._tasks.get(task_id)
+                    if task:
+                        task.status = TaskStatus.CANCELLED
+                        task.completed_at = datetime.now()
+                        task.message = "Task cancelled during execution"
+                        self._broadcast_event("task_cancelled", task.to_dict())
+                self._cleanup_old_tasks()
+                return None
+
             logger.error(
                 f"[TaskQueue] 自定义任务失败: {task_id}, 错误: {error_msg}"
             )

@@ -156,6 +156,8 @@ def _run_market_review_background(
         }
         if query_id:
             review_kwargs["query_id"] = query_id
+            task_queue = get_task_queue()
+            review_kwargs["cancellation_fn"] = lambda: task_queue.is_task_cancelled(query_id)
         logger.info(
             "[MarketReview] component=market_review action=background_start "
             "trigger_source=api task_id=%s region=%s",

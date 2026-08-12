@@ -112,6 +112,22 @@ class DailyMarketContextService:
         self._cache: Dict[Tuple[Any, ...], DailyMarketContext] = {}
         self._lock = threading.Lock()
 
+    def _is_context_stale(
+        self,
+        context: DailyMarketContext,
+        target_date: date,
+        allow_stale_seconds: float,
+    ) -> bool:
+        if context.trade_date != target_date:
+            return True
+        if context.status not in ("fresh", "partial"):
+            return True
+        if context.created_at is not None:
+            age = (datetime.now() - context.created_at).total_seconds()
+            if age > allow_stale_seconds:
+                return True
+        return False
+
     def get_context(
         self,
         *,
@@ -126,6 +142,7 @@ class DailyMarketContextService:
         target_date: Optional[date] = None,
         current_query_id: Optional[str] = None,
         require_query_id_match: bool = False,
+        market_context_policy: Optional[str] = None,
     ) -> Optional[DailyMarketContext]:
         normalized_region = _normalize_context_region(region)
         if normalized_region is None:
@@ -135,6 +152,19 @@ class DailyMarketContextService:
             )
             return None
         context_date = target_date or self._today_fn()
+        policy = (market_context_policy or getattr(config, "market_context_policy", "optional") or "optional").lower()
+
+        if policy == "disabled":
+            logger.info("Market context policy is 'disabled', skipping market review context fetching: region=%s", normalized_region)
+            return DailyMarketContext(
+                region=normalized_region,
+                trade_date=context_date,
+                summary="[已禁用大盘上下文]",
+                source="disabled",
+                status="disabled",
+                created_at=datetime.now(),
+            )
+
         report_language = normalize_report_language(getattr(config, "report_language", "zh"))
         cache_key = self._cache_key(
             context_date=context_date,
@@ -143,6 +173,7 @@ class DailyMarketContextService:
             require_query_id_match=require_query_id_match,
             report_language=report_language,
         )
+        allow_stale_seconds = float(getattr(config, "market_review_allow_stale_cache_seconds", 3600))
 
         if force_refresh:
             with self._lock:
@@ -159,7 +190,11 @@ class DailyMarketContextService:
                 cached,
                 current_query_id=current_query_id,
             ):
-                return cached
+                is_stale = self._is_context_stale(cached, context_date, allow_stale_seconds)
+                if policy == "required" and is_stale:
+                    logger.warning("[MarketContext] Cache is stale, rejecting in required policy: key=%s", cache_key)
+                else:
+                    return cached
 
             if cached is not None:
                 self._cache.pop(cache_key, None)
@@ -172,7 +207,11 @@ class DailyMarketContextService:
                 report_language=report_language,
             )
             if runtime_context is not None:
-                return runtime_context
+                is_stale = self._is_context_stale(runtime_context, context_date, allow_stale_seconds)
+                if policy == "required" and is_stale:
+                    logger.warning("[MarketContext] Runtime context is stale, rejecting in required policy")
+                else:
+                    return runtime_context
 
             history_context = self._load_same_day_history(
                 region=normalized_region,
@@ -182,15 +221,23 @@ class DailyMarketContextService:
                 report_language=report_language,
             )
             if history_context is not None:
-                self._cache[cache_key] = history_context
-                return history_context
+                is_stale = self._is_context_stale(history_context, context_date, allow_stale_seconds)
+                if policy == "required" and is_stale:
+                    logger.warning("[MarketContext] DB history context is stale, rejecting in required policy")
+                else:
+                    self._cache[cache_key] = history_context
+                    return history_context
 
         if not allow_generate:
             if force_refresh:
                 with self._lock:
                     cached = self._cache.get(cache_key)
                     if cached is not None:
-                        return cached
+                        is_stale = self._is_context_stale(cached, context_date, allow_stale_seconds)
+                        if policy == "required" and is_stale:
+                            pass
+                        else:
+                            return cached
                     history_context = self._load_same_day_history(
                         region=normalized_region,
                         target_date=context_date,
@@ -199,8 +246,14 @@ class DailyMarketContextService:
                         report_language=report_language,
                     )
                     if history_context is not None:
-                        self._cache[cache_key] = history_context
-                        return history_context
+                        is_stale = self._is_context_stale(history_context, context_date, allow_stale_seconds)
+                        if policy == "required" and is_stale:
+                            pass
+                        else:
+                            self._cache[cache_key] = history_context
+                            return history_context
+            if policy == "required":
+                raise MarketReviewDataUnavailableError("Required market context unavailable: generation not allowed and no fresh cache")
             return None
 
         with self._lock:
@@ -210,7 +263,11 @@ class DailyMarketContextService:
                     cached,
                     current_query_id=current_query_id,
                 ):
-                    return cached
+                    is_stale = self._is_context_stale(cached, context_date, allow_stale_seconds)
+                    if policy == "required" and is_stale:
+                        pass
+                    else:
+                        return cached
                 if cached is not None:
                     self._cache.pop(cache_key, None)
                 runtime_context = self._load_current_query_runtime_cache(
@@ -221,7 +278,11 @@ class DailyMarketContextService:
                     report_language=report_language,
                 )
                 if runtime_context is not None:
-                    return runtime_context
+                    is_stale = self._is_context_stale(runtime_context, context_date, allow_stale_seconds)
+                    if policy == "required" and is_stale:
+                        pass
+                    else:
+                        return runtime_context
                 history_context = self._load_same_day_history(
                     region=normalized_region,
                     target_date=context_date,
@@ -230,8 +291,12 @@ class DailyMarketContextService:
                     report_language=report_language,
                 )
                 if history_context is not None:
-                    self._cache[cache_key] = history_context
-                    return history_context
+                    is_stale = self._is_context_stale(history_context, context_date, allow_stale_seconds)
+                    if policy == "required" and is_stale:
+                        pass
+                    else:
+                        self._cache[cache_key] = history_context
+                        return history_context
 
             generated = self._run_market_review_context(
                 region=normalized_region,
@@ -245,7 +310,14 @@ class DailyMarketContextService:
                 require_query_id_match=require_query_id_match,
             )
             if generated is not None:
+                if policy == "required" and generated.status != "fresh":
+                    raise MarketReviewDataUnavailableError(
+                        f"Required market context generation returned non-fresh status: {generated.status}",
+                        diagnostics={"status": generated.status},
+                    )
                 self._cache[cache_key] = generated
+            elif policy == "required":
+                raise MarketReviewDataUnavailableError("Required market context generation failed to produce context")
             return generated
 
     def _load_same_day_history(
